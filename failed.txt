@@ -1,0 +1,29 @@
+2026-09-24-12-48-07
+https://open.spotify.com/track/0Ku088EwcUjIuDoAl77kzO - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/try-to-change
+https://open.spotify.com/track/15geVctY3jvUuDkEAaQPdV - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/mother-mother-o-my-heart
+https://open.spotify.com/track/6q5wsa7S7wyyFyvTXECtTg - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/body-of-years
+https://open.spotify.com/track/007JQyyu6DrGza9XX6scAN - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/wrecking-ball
+https://open.spotify.com/track/5plW0IS6XNNFFvLCH15edI - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/arms-tonight
+https://open.spotify.com/track/36RPuGznqDprSxcjSuguZ8 - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/sleep-awake
+2026-09-24-12-49-30
+https://open.spotify.com/track/5hSn8gYsyzs9ZqwmSNhMOZ - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/two
+https://open.spotify.com/track/4D6AfuVSDyUFmkZKPddGvY - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/seven
+https://open.spotify.com/track/1Ka3YT2EA2UTYXOJfXPynj - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/sick-of-the-silence
+https://open.spotify.com/track/5iZshBS76h2djj52INltWQ - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/forgotten-souls
+https://open.spotify.com/track/6fPXf3Ijon1013pSvQRvfC - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/pure-love
+https://open.spotify.com/track/40N7YSMqqYIZWdbZ2cd0ql - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/weep
+https://open.spotify.com/track/6KFzbEqE23406Ltv227wis - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/stay-behind
+https://open.spotify.com/track/5DPArtpuPG10zd5gxu8kBQ - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/i-got-love
+https://open.spotify.com/track/25Uy0tSDmhgHNEIuiOLaHe - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/the-knack
+https://open.spotify.com/track/6yDVj6pbzkIHAqpk8Tk6Hr - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/girl-alone
+https://open.spotify.com/track/2VvBGhMWyS6muxO3DBa413 - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/like-a-child
+https://open.spotify.com/track/26qDRsgK5kUhKQDThazp2s - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/breathe
+https://open.spotify.com/track/4UkQkiQ2mCanqbDeEFnB9a - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/until-it-doesnt-hurt
+https://open.spotify.com/track/0SEmbXmJf8gBnkMLpegQmp - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/inside
+https://open.spotify.com/track/1rvjACaF139KT9adkSonkD - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/life
+https://open.spotify.com/track/0kYMwaQWABTkFff8AZjmYI - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/hayloft-ii
+https://open.spotify.com/track/4lhpee1xNh9VnJ3DAGytY9 - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/all-the-dying
+https://open.spotify.com/track/07de3YRabmvUpokZRvav6J - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/frying-pan
+https://open.spotify.com/track/4ZTm9poXkR1OP82lnKNntx - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/conversations
+https://open.spotify.com/track/69B9ygiHBi8DuBn9VqnJ3l - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/turpentine
+https://open.spotify.com/track/7wZmK348C8gLNsrnlGZP0P - AudioProviderError: YT-DLP download error - https://soundcloud.com/mother-mother/like-a-child-piano-demo
