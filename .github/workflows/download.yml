@@ -59,8 +59,11 @@ jobs:
 
           : > /tmp/track-urls.txt
           : > /tmp/resolution-failures.txt
-          : > /tmp/successful-tracks.txt
+          : > /tmp/downloaded-tracks.txt
+          : > /tmp/verified-downloads.txt
+          : > /tmp/library-added-tracks.txt
           : > /tmp/had-download-failures
+          : > /tmp/had-library-failures
           : > /tmp/library-hashes.txt
 
       - name: Resolve Spotify URLs
@@ -74,9 +77,9 @@ jobs:
             source="${source#"${source%%[![:space:]]*}"}"
             source="${source%"${source##*[![:space:]]}"}"
 
-          if [ -z "$source" ] || [[ "$source" == \#* ]]; then
-           continue
-          fi
+            if [ -z "$source" ] || [[ "$source" == \#* ]]; then
+              continue
+            fi
 
             echo ""
             echo "========================================"
@@ -96,9 +99,7 @@ jobs:
             else
               echo "Resolution failed:"
               echo "$source"
-
-              printf "%s\n" "$source" \
-                >> /tmp/resolution-failures.txt
+              printf "%s\n" "$source" >> /tmp/resolution-failures.txt
             fi
           done < urls.txt
 
@@ -135,7 +136,7 @@ jobs:
             echo "########################################"
 
             if grep -Fqx "$track" archive.txt; then
-              echo "Already downloaded. Skipping."
+              echo "Verified and archived. Skipping."
               continue
             fi
 
@@ -179,11 +180,7 @@ jobs:
                 > /tmp/new-mp3.txt
 
               while IFS= read -r candidate || [ -n "$candidate" ]; do
-                if [ -z "$candidate" ]; then
-                  continue
-                fi
-
-                if [ ! -s "$candidate" ]; then
+                if [ -z "$candidate" ] || [ ! -s "$candidate" ]; then
                   continue
                 fi
 
@@ -218,10 +215,11 @@ jobs:
 
             if [ "$success" -eq 1 ]; then
               echo ""
-              echo "TRACK SUCCESS"
+              echo "TRACK DOWNLOAD SUCCESS"
 
-              echo "$track" >> archive.txt
-              echo "$track" >> /tmp/successful-tracks.txt
+              printf "%s\t%s\n" \
+                "$track" \
+                "$successful_file" >> /tmp/verified-downloads.txt
             else
               echo ""
               echo "ALL PROVIDERS FAILED"
@@ -236,8 +234,6 @@ jobs:
             fi
           done < /tmp/track-urls.txt
 
-          sort -u archive.txt -o archive.txt
-
           echo "$had_failures" > /tmp/had-download-failures
 
           echo ""
@@ -246,17 +242,15 @@ jobs:
           echo "========================================"
 
           echo ""
-          echo "Successful tracks:"
-
-          if [ -s /tmp/successful-tracks.txt ]; then
-            wc -l /tmp/successful-tracks.txt
+          echo "Verified downloads:"
+          if [ -s /tmp/verified-downloads.txt ]; then
+            wc -l /tmp/verified-downloads.txt
           else
             echo "0"
           fi
 
           echo ""
           echo "Failed tracks:"
-
           if [ -s failed.txt ]; then
             tail -n 50 failed.txt
           else
@@ -306,13 +300,8 @@ jobs:
               -d "$2"
           }
 
-          if ! find /tmp/music-downloads \
-            -type f \
-            -iname "*.mp3" \
-            -print -quit |
-            grep -q .
-          then
-            echo "No new music was downloaded."
+          if [ ! -s /tmp/verified-downloads.txt ]; then
+            echo "No new verified music was downloaded."
             exit 0
           fi
 
@@ -442,22 +431,16 @@ jobs:
 
             git clone \
               --quiet \
-              "$(
-                printf '%s' \
-                "https://x-access-token:${GIT_PAT}@github.com/${LIBRARY_OWNER}/${repo}.git"
-              )" \
+              "https://x-access-token:${GIT_PAT}@github.com/${LIBRARY_OWNER}/${repo}.git" \
               "/tmp/library-scan/$repo"
 
+            find "/tmp/library-scan/$repo" \
+              -type f \
+              -iname "*.mp3" \
+              -print0 |
             while IFS= read -r -d '' file; do
-              if [ -f "$file" ]; then
-                md5sum "$file" | awk '{print $1}'
-              fi
-            done < <(
-              find "/tmp/library-scan/$repo" \
-                -type f \
-                -iname "*.mp3" \
-                -print0
-            )
+              md5sum "$file" | awk '{print $1}'
+            done
           }
 
           echo ""
@@ -498,7 +481,6 @@ jobs:
 
           hash_exists() {
             local hash="$1"
-
             grep -Fqx "$hash" /tmp/library-hashes.txt
           }
 
@@ -517,11 +499,10 @@ jobs:
 
             if ! git diff --cached --quiet; then
               git commit -m "Add downloaded music"
+              git push origin main
             else
               echo "No library changes to commit."
             fi
-
-            git push origin main
 
             echo "Push complete."
           }
@@ -534,12 +515,17 @@ jobs:
           echo "Existing current library size:"
           echo "$current_size bytes"
 
-          while IFS= read -r audio_file || [ -n "$audio_file" ]; do
-            if [ -z "$audio_file" ]; then
+          library_failed=0
+
+          while IFS=$'\t' read -r track audio_file || [ -n "$track" ]; do
+            if [ -z "$track" ] || [ -z "$audio_file" ]; then
               continue
             fi
 
             if [ ! -f "$audio_file" ]; then
+              echo "Downloaded file disappeared:"
+              echo "$audio_file"
+              library_failed=1
               continue
             fi
 
@@ -548,6 +534,8 @@ jobs:
 
             echo ""
             echo "----------------------------------------"
+            echo "Track:"
+            echo "$track"
             echo "File:"
             echo "$audio_file"
             echo "Size:"
@@ -561,23 +549,25 @@ jobs:
               echo "DUPLICATE"
               echo "An identical MP3 already exists somewhere"
               echo "in the music-library repositories."
-              echo "Skipping:"
+              echo "Skipping file:"
               echo "$audio_file"
 
               rm -f "$audio_file"
 
+              printf "%s\n" "$track" >> /tmp/library-added-tracks.txt
+              continue
+            fi
+
+            if [ "$file_size" -gt "$LIBRARY_LIMIT_BYTES" ]; then
+              echo ""
+              echo "File is larger than the entire 900 MiB library limit."
+              echo "Cannot store:"
+              echo "$audio_file"
+              library_failed=1
               continue
             fi
 
             projected_size=$((current_size + file_size))
-
-            echo ""
-            echo "Current library:"
-            echo "$current_repo"
-            echo "Current size:"
-            echo "$current_size bytes"
-            echo "Projected size:"
-            echo "$projected_size bytes"
 
             if [ "$current_size" -gt 0 ] && [ "$projected_size" -gt "$LIBRARY_LIMIT_BYTES" ]; then
               echo ""
@@ -620,6 +610,7 @@ jobs:
 
                   rm -f "$audio_file"
 
+                  printf "%s\n" "$track" >> /tmp/library-added-tracks.txt
                   continue
                 fi
               fi
@@ -630,27 +621,26 @@ jobs:
 
             cp -p "$audio_file" "$destination"
 
-            printf "%s\n" "$file_hash" \
-              >> /tmp/library-hashes.txt
-
-            sort -u /tmp/library-hashes.txt \
-              -o /tmp/library-hashes.txt
+            printf "%s\n" "$file_hash" >> /tmp/library-hashes.txt
+            sort -u /tmp/library-hashes.txt -o /tmp/library-hashes.txt
 
             current_size=$((current_size + file_size))
+
+            printf "%s\n" "$track" >> /tmp/library-added-tracks.txt
 
             echo ""
             echo "Added:"
             echo "${destination#/tmp/library/}"
 
-          done < <(
-            find /tmp/music-downloads \
-              -type f \
-              -iname "*.mp3" \
-              -print |
-            sort
-          )
+          done < /tmp/verified-downloads.txt
 
           push_library "$current_size"
+
+          if [ "$library_failed" -eq 1 ]; then
+            echo "1" > /tmp/had-library-failures
+          else
+            echo "0" > /tmp/had-library-failures
+          fi
 
           echo ""
           echo "========================================"
@@ -662,6 +652,34 @@ jobs:
 
           echo "Final size:"
           echo "$current_size bytes"
+
+      - name: Finalize successful archive
+        if: always()
+        run: |
+          set -u
+
+          if [ ! -s /tmp/verified-downloads.txt ]; then
+            echo "No verified downloads to archive."
+            exit 0
+          fi
+
+          if [ -f /tmp/had-library-failures ] &&
+             [ "$(cat /tmp/had-library-failures)" = "1" ]; then
+            echo "Library processing had failures."
+            echo "Verified tracks will NOT be added to archive.txt."
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r track audio_file || [ -n "$track" ]; do
+            if [ -n "$track" ]; then
+              printf "%s\n" "$track" >> archive.txt
+            fi
+          done < /tmp/verified-downloads.txt
+
+          sort -u archive.txt -o archive.txt
+
+          echo "Archived verified tracks:"
+          wc -l /tmp/verified-downloads.txt
 
       - name: Update downloader state
         if: always()
@@ -693,12 +711,24 @@ jobs:
       - name: Report failures
         if: always()
         run: |
-          if [ -f /tmp/had-download-failures ]; then
-            if [ "$(cat /tmp/had-download-failures)" = "1" ]; then
-              echo ""
-              echo "Some tracks failed with all providers."
-              echo "They will be retried on the next run."
-            fi
+          echo ""
+          echo "========================================"
+          echo "FINAL REPORT"
+          echo "========================================"
+
+          if [ -f /tmp/had-download-failures ] &&
+             [ "$(cat /tmp/had-download-failures)" = "1" ]; then
+            echo ""
+            echo "Some tracks failed with all providers."
+            echo "They were NOT added to archive.txt."
+            echo "They will be retried on the next run."
+          fi
+
+          if [ -f /tmp/had-library-failures ] &&
+             [ "$(cat /tmp/had-library-failures)" = "1" ]; then
+            echo ""
+            echo "Some verified downloads could not be added to the library."
+            echo "Those tracks were NOT added to archive.txt."
           fi
 
           if [ -s /tmp/resolution-failures.txt ]; then
