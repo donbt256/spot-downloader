@@ -49,8 +49,10 @@ jobs:
         run: |
           rm -rf /tmp/music-downloads
           rm -rf /tmp/library
+          rm -rf /tmp/library-scan
 
           mkdir -p /tmp/music-downloads
+          mkdir -p /tmp/library-scan
 
           touch archive.txt
           touch failed.txt
@@ -59,6 +61,7 @@ jobs:
           : > /tmp/resolution-failures.txt
           : > /tmp/successful-tracks.txt
           : > /tmp/had-download-failures
+          : > /tmp/library-hashes.txt
 
       - name: Resolve Spotify URLs
         env:
@@ -303,8 +306,8 @@ jobs:
           if ! find /tmp/music-downloads \
             -type f \
             -iname "*.mp3" \
-            -print -quit \
-            | grep -q .
+            -print -quit |
+            grep -q .
           then
             echo "No new music was downloaded."
             exit 0
@@ -324,7 +327,7 @@ jobs:
             fi
 
             while IFS= read -r repo_name; do
-              if [[ "$repo_name" =~ ^music-library-([0-9]+)$ ]]; then
+              if [[ "$repo_name" =~ ^${LIBRARY_PREFIX}([0-9]+)$ ]]; then
                 number="${BASH_REMATCH[1]}"
                 number=$((10#$number))
 
@@ -344,7 +347,7 @@ jobs:
           current_number="$highest_number"
 
           printf -v current_repo \
-            "music-library-%03d" \
+            "${LIBRARY_PREFIX}%03d" \
             "$current_number"
 
           echo ""
@@ -425,6 +428,77 @@ jobs:
               '
           }
 
+          build_hash_index() {
+            local repo="$1"
+
+            echo ""
+            echo "Building MD5 index for:"
+            echo "$repo"
+
+            rm -rf "/tmp/library-scan/$repo"
+
+            git clone \
+              --quiet \
+              "$(
+                printf '%s' \
+                "https://x-access-token:${GIT_PAT}@github.com/${LIBRARY_OWNER}/${repo}.git"
+              )" \
+              "/tmp/library-scan/$repo"
+
+            while IFS= read -r -d '' file; do
+              if [ -f "$file" ]; then
+                md5sum "$file" | awk '{print $1}'
+              fi
+            done < <(
+              find "/tmp/library-scan/$repo" \
+                -type f \
+                -iname "*.mp3" \
+                -print0
+            )
+          }
+
+          echo ""
+          echo "========================================"
+          echo "BUILDING LIBRARY HASH INDEX"
+          echo "========================================"
+
+          : > /tmp/library-hashes.txt
+
+          page=1
+
+          while true; do
+            repos=$(api_get \
+              "${API}/user/repos?visibility=all&affiliation=owner&per_page=100&page=${page}")
+
+            count=$(printf "%s" "$repos" | jq "length")
+
+            if [ "$count" -eq 0 ]; then
+              break
+            fi
+
+            while IFS= read -r repo_name; do
+              if [[ "$repo_name" =~ ^${LIBRARY_PREFIX}[0-9]+$ ]]; then
+                build_hash_index "$repo_name" \
+                  >> /tmp/library-hashes.txt
+              fi
+            done < <(printf "%s" "$repos" | jq -r ".[].name")
+
+            page=$((page + 1))
+          done
+
+          sort -u /tmp/library-hashes.txt \
+            -o /tmp/library-hashes.txt
+
+          echo ""
+          echo "Existing unique MP3 hashes:"
+          wc -l /tmp/library-hashes.txt
+
+          hash_exists() {
+            local hash="$1"
+
+            grep -Fqx "$hash" /tmp/library-hashes.txt
+          }
+
           push_library() {
             local size="$1"
 
@@ -454,7 +528,7 @@ jobs:
           current_size=$(get_library_size)
 
           echo ""
-          echo "Existing library size:"
+          echo "Existing current library size:"
           echo "$current_size bytes"
 
           while IFS= read -r audio_file || [ -n "$audio_file" ]; do
@@ -467,7 +541,7 @@ jobs:
             fi
 
             file_size=$(stat -c "%s" "$audio_file")
-            projected_size=$((current_size + file_size))
+            file_hash=$(md5sum "$audio_file" | awk '{print $1}')
 
             echo ""
             echo "----------------------------------------"
@@ -475,13 +549,32 @@ jobs:
             echo "$audio_file"
             echo "Size:"
             echo "$file_size bytes"
+            echo "MD5:"
+            echo "$file_hash"
+            echo "----------------------------------------"
+
+            if hash_exists "$file_hash"; then
+              echo ""
+              echo "DUPLICATE"
+              echo "An identical MP3 already exists somewhere"
+              echo "in the music-library repositories."
+              echo "Skipping:"
+              echo "$audio_file"
+
+              rm -f "$audio_file"
+
+              continue
+            fi
+
+            projected_size=$((current_size + file_size))
+
+            echo ""
             echo "Current library:"
             echo "$current_repo"
             echo "Current size:"
             echo "$current_size bytes"
             echo "Projected size:"
             echo "$projected_size bytes"
-            echo "----------------------------------------"
 
             if [ "$current_size" -gt 0 ] && [ "$projected_size" -gt "$LIBRARY_LIMIT_BYTES" ]; then
               echo ""
@@ -493,12 +586,18 @@ jobs:
               current_number=$((current_number + 1))
 
               printf -v current_repo \
-                "music-library-%03d" \
+                "${LIBRARY_PREFIX}%03d" \
                 "$current_number"
 
               clone_library "$current_repo"
 
               current_size=$(get_library_size)
+
+              echo ""
+              echo "New library:"
+              echo "$current_repo"
+
+              projected_size=$((current_size + file_size))
             fi
 
             relative_path="${audio_file#/tmp/music-downloads/}"
@@ -510,12 +609,16 @@ jobs:
               existing_size=$(stat -c "%s" "$destination")
 
               if [ "$existing_size" -eq "$file_size" ]; then
-                echo "Already exists:"
-                echo "$relative_path"
+                existing_hash=$(md5sum "$destination" | awk '{print $1}')
 
-                rm -f "$audio_file"
+                if [ "$existing_hash" = "$file_hash" ]; then
+                  echo "Identical file already exists at:"
+                  echo "$relative_path"
 
-                continue
+                  rm -f "$audio_file"
+
+                  continue
+                fi
               fi
 
               base="${destination%.mp3}"
@@ -523,6 +626,12 @@ jobs:
             fi
 
             cp -p "$audio_file" "$destination"
+
+            printf "%s\n" "$file_hash" \
+              >> /tmp/library-hashes.txt
+
+            sort -u /tmp/library-hashes.txt \
+              -o /tmp/library-hashes.txt
 
             current_size=$((current_size + file_size))
 
