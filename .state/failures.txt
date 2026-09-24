@@ -8,6 +8,8 @@ source=1	track=3	artist=Mother Mother	title=Body Of Years	url=https://open.spoti
 source=1	track=3	artist=Mother Mother	title=O My Heart	url=https://open.spotify.com/track/15geVctY3jvUuDkEAaQPdV
 source=1	track=4	artist=Mother Mother	title=Body Of Years	url=https://open.spotify.com/track/6q5wsa7S7wyyFyvTXECtTg
 source=1	track=4	artist=Mother Mother	title=Try To Change	url=https://open.spotify.com/track/0Ku088EwcUjIuDoAl77kzO
+source=1	track=5	artist=Mother Mother	title=Wisdom	url=https://open.spotify.com/track/4ROgUDXvfguYoNmZ5htlnw
+source=1	track=8	artist=Mother Mother	title=Hayloft	url=https://open.spotify.com/track/2kKkl59fY6Cic1CmhvSEZK
 source=1	track=8	artist=Mother Mother	title=Wrecking Ball	url=https://open.spotify.com/track/007JQyyu6DrGza9XX6scAN
 source=1	track=9	artist=Mother Mother	title=Arms Tonite	url=https://open.spotify.com/track/5plW0IS6XNNFFvLCH15edI
 source=1	track=9	artist=Mother Mother	title=Wrecking Ball	url=https://open.spotify.com/track/007JQyyu6DrGza9XX6scAN
