@@ -183,22 +183,62 @@ jobs:
           }
 
           get_library_repos() {
-            api_get "${API}/users/${OWNER}/repos?per_page=100&page=1&type=all" |
-              jq -r --arg prefix "$LIBRARY_PREFIX" '
+            local page=1
+            local response
+            local names=""
+
+            while :; do
+              response="$(api_get "${API}/users/${OWNER}/repos?per_page=100&page=${page}&type=all")"
+
+              page_names="$(jq -r --arg prefix "$LIBRARY_PREFIX" '
                 .[]
                 | select(.name | startswith($prefix))
                 | select(.name | test("^music-library-[0-9]{3}$"))
                 | .name
-              ' |
-              sort
+              ' <<< "$response")"
+
+              if [ -n "$page_names" ]; then
+                names="${names}${page_names}"$'\n'
+              fi
+
+              count="$(jq 'length' <<< "$response")"
+              [ "$count" -lt 100 ] && break
+
+              page=$((page + 1))
+            done
+
+            printf '%s' "$names" |
+              sed '/^$/d' |
+              sort -V -u
           }
 
-          ensure_repo "music-library-001"
+          # GitHub's repository-listing endpoint can lag briefly after repository
+          # creation. Do not depend on that listing to discover the first repo:
+          # we already know its exact name.
+          FIRST_LIBRARY="music-library-001"
+          ensure_repo "$FIRST_LIBRARY"
 
           mapfile -t LIBRARIES < <(get_library_repos)
 
+          # If the API listing has not caught up yet, explicitly verify the known
+          # repository and use it directly.
           if [ "${#LIBRARIES[@]}" -eq 0 ]; then
-            echo "No library repositories found after creating music-library-001."
+            if repo_exists "$FIRST_LIBRARY"; then
+              LIBRARIES=("$FIRST_LIBRARY")
+              echo "Repository listing has not caught up; using ${FIRST_LIBRARY} directly."
+            else
+              echo "Library repository ${OWNER}/${FIRST_LIBRARY} could not be verified."
+              exit 1
+            fi
+          elif ! printf '%s\n' "${LIBRARIES[@]}" | grep -qx "$FIRST_LIBRARY"; then
+            if repo_exists "$FIRST_LIBRARY"; then
+              LIBRARIES+=("$FIRST_LIBRARY")
+              mapfile -t LIBRARIES < <(printf '%s\n' "${LIBRARIES[@]}" | sed '/^$/d' | sort -V -u)
+            fi
+          fi
+
+          if [ "${#LIBRARIES[@]}" -eq 0 ]; then
+            echo "No library repositories available."
             exit 1
           fi
 
@@ -820,8 +860,10 @@ jobs:
                     BEGIN {
                       diff = actual - expected
                       if (diff < 0) diff = -diff
-                      tolerance = expected * 0.03
-                      if (tolerance < 5) tolerance = 5
+                      # Allow modest release/encoding/mastering differences:
+                      # 8% of expected duration, with a minimum of 15 seconds.
+                      tolerance = expected * 0.08
+                      if (tolerance < 15) tolerance = 15
                       exit !(diff <= tolerance)
                     }
                   '; then
@@ -985,12 +1027,28 @@ jobs:
 
             echo "Checkpointing source #${source_id} into the music library..."
 
-            if ! GIT_PAT="$GIT_PAT" \
-              SOURCE_ID="$source_id" \
-              VERIFIED_TSV="$source_verified" \
-              LIBRARY_LIMIT_BYTES="$LIBRARY_LIMIT_BYTES" \
-              ./scripts/push-source-to-library.sh < /dev/null; then
-              echo "Library checkpoint failed for source #${source_id}."
+            checkpoint_ok="false"
+
+            for checkpoint_attempt in 1 2 3; do
+              echo "Library checkpoint attempt ${checkpoint_attempt}/3"
+
+              if GIT_PAT="$GIT_PAT" \
+                SOURCE_ID="$source_id" \
+                VERIFIED_TSV="$source_verified" \
+                LIBRARY_LIMIT_BYTES="$LIBRARY_LIMIT_BYTES" \
+                ./scripts/push-source-to-library.sh < /dev/null; then
+                checkpoint_ok="true"
+                break
+              fi
+
+              if [ "$checkpoint_attempt" -lt 3 ]; then
+                echo "Library checkpoint attempt failed; retrying in 5 seconds..."
+                sleep 5
+              fi
+            done
+
+            if [ "$checkpoint_ok" != "true" ]; then
+              echo "Library checkpoint failed for source #${source_id} after 3 attempts."
               echo "source=${source_id} reason=library-checkpoint-failed" >> "$FAILURES_FILE"
               continue
             fi
