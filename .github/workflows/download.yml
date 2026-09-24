@@ -269,7 +269,11 @@ jobs:
           CURRENT_DIR="${WORK_ROOT}/${CURRENT_REPO}"
 
           current_size() {
-            du -sb "$CURRENT_DIR" | awk '{print $1}'
+            git -C "$CURRENT_DIR" ls-files -z |
+              while IFS= read -r -d '' tracked; do
+                stat -c '%s' "$CURRENT_DIR/$tracked"
+              done |
+              awk '{sum += $1} END {print sum+0}'
           }
 
           new_repo_number() {
@@ -793,93 +797,222 @@ jobs:
               candidate=""
               provider_succeeded="false"
 
-              for provider in soundcloud bandcamp piped; do
-                provider_dir="${track_tmp}/${provider}"
-                mkdir -p "$provider_dir"
+              # SoundCloud gets special handling: spotDL normally uses the first
+              # matching SoundCloud result, but that result can be unavailable to
+              # yt-dlp even when another upload of the same track works.
+              #
+              # Search several SoundCloud results and test them individually.
+              provider="soundcloud"
+              provider_dir="${track_tmp}/${provider}"
+              mkdir -p "$provider_dir"
 
-                echo "Provider: ${provider}"
+              soundcloud_search="${artist} ${title}"
+              soundcloud_candidates="${track_tmp}/soundcloud-candidates.tsv"
 
-                if spotdl download "$spotify_url" \
-                  --client-id "$SPOTIFY_CLIENT_ID" \
-                  --client-secret "$SPOTIFY_CLIENT_SECRET" \
-                  --audio "$provider" \
-                  --format mp3 \
-                  --overwrite force \
-                  --output "${provider_dir}/%(title)s.%(output-ext)s" \
-                  --print-errors \
-                  < /dev/null; then
-                  :
-                else
-                  echo "Provider command failed: ${provider}"
-                fi
+              echo "Provider: soundcloud"
+              echo "Searching SoundCloud for up to 10 candidates: ${soundcloud_search}"
 
-                candidate="$(find "$provider_dir" -type f -iname '*.mp3' -print -quit || true)"
+              if yt-dlp \
+                "scsearch10:${soundcloud_search}" \
+                --flat-playlist \
+                --print "%(webpage_url)s\t%(title)s" \
+                --skip-download \
+                --no-warnings \
+                > "$soundcloud_candidates" 2>"${track_tmp}/soundcloud-search.log"; then
+                :
+              else
+                echo "SoundCloud search command failed."
+              fi
 
-                if [ -z "$candidate" ]; then
-                  echo "No MP3 produced by ${provider}."
-                  continue
-                fi
+              if [ -s "$soundcloud_candidates" ]; then
+                candidate_number=0
 
-                echo "Candidate: ${candidate}"
+                while IFS=$'\t' read -r soundcloud_url soundcloud_title; do
+                  [ -n "${soundcloud_url:-}" ] || continue
 
-                codec="$(ffprobe -v error -select_streams a:0 \
-                  -show_entries stream=codec_name \
-                  -of default=noprint_wrappers=1:nokey=1 \
-                  "$candidate" < /dev/null || true)"
+                  candidate_number=$((candidate_number + 1))
+                  candidate_dir="${provider_dir}/candidate-${candidate_number}"
+                  mkdir -p "$candidate_dir"
 
-                actual_duration="$(ffprobe -v error \
-                  -show_entries format=duration \
-                  -of default=noprint_wrappers=1:nokey=1 \
-                  "$candidate" < /dev/null || true)"
+                  echo
+                  echo "SoundCloud candidate ${candidate_number}: ${soundcloud_title}"
+                  echo "URL: ${soundcloud_url}"
 
-                if [ "$codec" != "mp3" ]; then
-                  echo "Rejected: codec is '${codec}', not mp3."
-                  mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").${provider}.badcodec" || true
-                  candidate=""
-                  continue
-                fi
+                  candidate_log="${candidate_dir}/yt-dlp.log"
 
-                if ! awk -v d="${actual_duration:-0}" 'BEGIN { exit !(d > 5) }'; then
-                  echo "Rejected: duration is too short."
-                  mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").${provider}.short" || true
-                  candidate=""
-                  continue
-                fi
+                  if yt-dlp \
+                    "$soundcloud_url" \
+                    --extract-audio \
+                    --audio-format mp3 \
+                    --audio-quality 0 \
+                    --no-playlist \
+                    --no-warnings \
+                    --output "${candidate_dir}/%(title)s.%(ext)s" \
+                    >"${candidate_dir}/stdout.log" 2>"$candidate_log"; then
+                    :
+                  else
+                    echo "SoundCloud candidate ${candidate_number} failed to download."
+                    echo "  See: ${candidate_log}"
+                  fi
 
-                if ! ffmpeg -nostdin -v error -i "$candidate" -f null - </dev/null; then
-                  echo "Rejected: FFmpeg decode failed."
-                  mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").${provider}.decode" || true
-                  candidate=""
-                  continue
-                fi
+                  candidate="$(find "$candidate_dir" -type f -iname '*.mp3' -print -quit || true)"
 
-                if [ "$duration_ms" -gt 0 ]; then
-                  expected_seconds="$(awk -v ms="$duration_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
+                  if [ -z "$candidate" ]; then
+                    continue
+                  fi
 
-                  if ! awk -v actual="${actual_duration:-0}" -v expected="$expected_seconds" '
-                    BEGIN {
-                      diff = actual - expected
-                      if (diff < 0) diff = -diff
-                      # Allow modest release/encoding/mastering differences:
-                      # 8% of expected duration, with a minimum of 15 seconds.
-                      tolerance = expected * 0.08
-                      if (tolerance < 15) tolerance = 15
-                      exit !(diff <= tolerance)
-                    }
-                  '; then
-                    echo "Rejected: duration mismatch."
-                    echo "  Expected: ${expected_seconds}s"
-                    echo "  Actual:   ${actual_duration}s"
-                    mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").${provider}.duration" || true
+                  echo "Candidate file: ${candidate}"
+
+                  codec="$(ffprobe -v error -select_streams a:0 \
+                    -show_entries stream=codec_name \
+                    -of default=noprint_wrappers=1:nokey=1 \
+                    "$candidate" < /dev/null || true)"
+
+                  actual_duration="$(ffprobe -v error \
+                    -show_entries format=duration \
+                    -of default=noprint_wrappers=1:nokey=1 \
+                    "$candidate" < /dev/null || true)"
+
+                  if [ "$codec" != "mp3" ]; then
+                    echo "Rejected SoundCloud candidate ${candidate_number}: codec is '${codec}', not mp3."
+                    mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").soundcloud.badcodec" || true
                     candidate=""
                     continue
                   fi
-                fi
 
-                provider_succeeded="true"
-                echo "Validated download from ${provider}."
-                break
-              done
+                  if ! awk -v d="${actual_duration:-0}" 'BEGIN { exit !(d > 5) }'; then
+                    echo "Rejected SoundCloud candidate ${candidate_number}: duration is too short."
+                    mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").soundcloud.short" || true
+                    candidate=""
+                    continue
+                  fi
+
+                  if ! ffmpeg -nostdin -v error -i "$candidate" -f null - </dev/null; then
+                    echo "Rejected SoundCloud candidate ${candidate_number}: FFmpeg decode failed."
+                    mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").soundcloud.decode" || true
+                    candidate=""
+                    continue
+                  fi
+
+                  if [ "$duration_ms" -gt 0 ]; then
+                    expected_seconds="$(awk -v ms="$duration_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
+
+                    if ! awk -v actual="${actual_duration:-0}" -v expected="$expected_seconds" '
+                      BEGIN {
+                        diff = actual - expected
+                        if (diff < 0) diff = -diff
+                        tolerance = expected * 0.08
+                        if (tolerance < 15) tolerance = 15
+                        exit !(diff <= tolerance)
+                      }
+                    '; then
+                      echo "Rejected SoundCloud candidate ${candidate_number}: duration mismatch."
+                      echo "  Expected: ${expected_seconds}s"
+                      echo "  Actual:   ${actual_duration}s"
+                      mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").soundcloud.duration" || true
+                      candidate=""
+                      continue
+                    fi
+                  fi
+
+                  provider_succeeded="true"
+                  echo "Validated SoundCloud candidate ${candidate_number}."
+                  break
+                done < "$soundcloud_candidates"
+              else
+                echo "No SoundCloud candidates found."
+              fi
+
+              # If SoundCloud did not produce a valid candidate, fall back to the
+              # existing Bandcamp and Piped providers.
+              if [ "$provider_succeeded" != "true" ]; then
+                for provider in bandcamp piped; do
+                  provider_dir="${track_tmp}/${provider}"
+                  mkdir -p "$provider_dir"
+
+                  echo
+                  echo "Provider: ${provider}"
+
+                  if spotdl download "$spotify_url" \
+                    --client-id "$SPOTIFY_CLIENT_ID" \
+                    --client-secret "$SPOTIFY_CLIENT_SECRET" \
+                    --audio "$provider" \
+                    --format mp3 \
+                    --overwrite force \
+                    --output "${provider_dir}/%(title)s.%(output-ext)s" \
+                    --print-errors \
+                    < /dev/null; then
+                    :
+                  else
+                    echo "Provider command failed: ${provider}"
+                  fi
+
+                  candidate="$(find "$provider_dir" -type f -iname '*.mp3' -print -quit || true)"
+
+                  if [ -z "$candidate" ]; then
+                    echo "No MP3 produced by ${provider}."
+                    continue
+                  fi
+
+                  echo "Candidate: ${candidate}"
+
+                  codec="$(ffprobe -v error -select_streams a:0 \
+                    -show_entries stream=codec_name \
+                    -of default=noprint_wrappers=1:nokey=1 \
+                    "$candidate" < /dev/null || true)"
+
+                  actual_duration="$(ffprobe -v error \
+                    -show_entries format=duration \
+                    -of default=noprint_wrappers=1:nokey=1 \
+                    "$candidate" < /dev/null || true)"
+
+                  if [ "$codec" != "mp3" ]; then
+                    echo "Rejected: codec is '${codec}', not mp3."
+                    mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").${provider}.badcodec" || true
+                    candidate=""
+                    continue
+                  fi
+
+                  if ! awk -v d="${actual_duration:-0}" 'BEGIN { exit !(d > 5) }'; then
+                    echo "Rejected: duration is too short."
+                    mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").${provider}.short" || true
+                    candidate=""
+                    continue
+                  fi
+
+                  if ! ffmpeg -nostdin -v error -i "$candidate" -f null - </dev/null; then
+                    echo "Rejected: FFmpeg decode failed."
+                    mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").${provider}.decode" || true
+                    candidate=""
+                    continue
+                  fi
+
+                  if [ "$duration_ms" -gt 0 ]; then
+                    expected_seconds="$(awk -v ms="$duration_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
+
+                    if ! awk -v actual="${actual_duration:-0}" -v expected="$expected_seconds" '
+                      BEGIN {
+                        diff = actual - expected
+                        if (diff < 0) diff = -diff
+                        tolerance = expected * 0.08
+                        if (tolerance < 15) tolerance = 15
+                        exit !(diff <= tolerance)
+                      }
+                    '; then
+                      echo "Rejected: duration mismatch."
+                      echo "  Expected: ${expected_seconds}s"
+                      echo "  Actual:   ${actual_duration}s"
+                      mv "$candidate" "$QUARANTINE_DIR/$(basename "$candidate").${provider}.duration" || true
+                      candidate=""
+                      continue
+                    fi
+                  fi
+
+                  provider_succeeded="true"
+                  echo "Validated download from ${provider}."
+                  break
+                done
+              fi
 
               if [ "$provider_succeeded" != "true" ] || [ -z "$candidate" ]; then
                 echo "All providers failed for ${artist} - ${title}"
@@ -1167,7 +1300,7 @@ jobs:
             echo "- Verified downloads: ${verified}"
             echo "- Failure records: ${failures}"
             echo
-            echo "Provider order: SoundCloud → Bandcamp → Piped"
+            echo "Provider order: SoundCloud (10 candidates) → Bandcamp → Piped"
             echo
             if [ "$failures" -gt 0 ]; then
               echo "### Failures"
