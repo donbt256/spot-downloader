@@ -1,375 +1,827 @@
-name: Download Music
+name: Download Spotify Music
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * *"
 
 permissions:
   contents: write
+
+env:
+  LIBRARY_OWNER: donbt256
+  LIBRARY_PREFIX: music-library-
+  START_LIBRARY_NUMBER: "001"
+
+  # GitHub strongly recommends staying below 5 GB.
+  # 4.5 GB gives us a safety margin.
+  LIBRARY_LIMIT_BYTES: "4831838208"
+
+  AUDIO_FORMAT: mp3
+  AUDIO_BITRATE: 128k
 
 jobs:
   download:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out downloader
+
+      # ------------------------------------------------------------
+      # Check out the downloader/state repository
+      # ------------------------------------------------------------
+
+      - name: Check out downloader repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # ------------------------------------------------------------
+      # Python
+      # ------------------------------------------------------------
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: Install FFmpeg and Git LFS
+      # ------------------------------------------------------------
+      # System dependencies
+      # ------------------------------------------------------------
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg git-lfs
+          sudo apt-get install -y ffmpeg git-lfs jq
           git lfs install
+
+      # ------------------------------------------------------------
+      # spotDL
+      # ------------------------------------------------------------
 
       - name: Install spotDL
         run: |
           python -m pip install --upgrade pip
           python -m pip install "spotdl==4.5.2"
 
-      - name: Install Deno
-        uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-
-      - name: Check installed versions
+      - name: Install Deno for spotDL
         run: |
-          python --version
-          ffmpeg -version | head -n 1
-          deno --version
-          spotdl --version
-          git lfs version
+          spotdl --download-deno
+
+      # ------------------------------------------------------------
+      # Prepare state
+      # ------------------------------------------------------------
 
       - name: Prepare directories
         run: |
           rm -rf /tmp/music-downloads
-          mkdir -p /tmp/music-downloads
+          rm -rf /tmp/library
+          rm -rf /tmp/library-work
 
-          rm -f /tmp/all-tracks.json
-          rm -f /tmp/track-urls.txt
+          mkdir -p /tmp/music-downloads
+          mkdir -p /tmp/library-work
 
           touch archive.txt
           touch failed.txt
 
-      - name: Resolve Spotify URLs into individual tracks
+          : > /tmp/track-urls.txt
+          : > /tmp/resolution-failures.txt
+          : > /tmp/successful-tracks.txt
+
+      # ------------------------------------------------------------
+      # Resolve albums/playlists/tracks from urls.txt into
+      # individual Spotify track URLs.
+      #
+      # spotDL's save operation writes JSON containing Song objects.
+      # ------------------------------------------------------------
+
+      - name: Resolve Spotify URLs
         env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
         run: |
           set -u
 
-          : > /tmp/track-urls.txt
+          while IFS= read -r source || [ -n "$source" ]; do
 
-          while IFS= read -r url || [ -n "$url" ]; do
-            [ -z "${url//[[:space:]]/}" ] && continue
+            # Ignore blank lines.
+            [ -z "${source//[[:space:]]/}" ] && continue
 
-            case "$url" in
-              \#*) continue ;;
-            esac
-
-            echo ""
+            echo
             echo "========================================"
             echo "Resolving:"
-            echo "$url"
+            echo "$source"
             echo "========================================"
 
             rm -f /tmp/current.spotdl
 
-            if ! spotdl save "$url" \
+            if ! spotdl save "$source" \
               --client-id "$SPOTIFY_CLIENT_ID" \
               --client-secret "$SPOTIFY_CLIENT_SECRET" \
               --save-file /tmp/current.spotdl
             then
-              echo "Could not resolve: $url"
-              echo "$url" >> failed.txt
+              echo "Resolution failed:"
+              echo "$source"
+
+              printf '%s\n' "$source" >> /tmp/resolution-failures.txt
               continue
             fi
 
-            python - <<'PY'
-          import json
+            python - <<'PY' >> /tmp/track-urls.txt
+import json
 
-          path = "/tmp/current.spotdl"
+path = "/tmp/current.spotdl"
 
-          with open(path, "r", encoding="utf-8") as f:
-              data = json.load(f)
+with open(path, "r", encoding="utf-8") as f:
+    songs = json.load(f)
 
-          if not isinstance(data, list):
-              raise SystemExit(f"Unexpected spotDL save format: {type(data)}")
+for song in songs:
+    url = song.get("url")
 
-          with open("/tmp/track-urls.txt", "a", encoding="utf-8") as out:
-              for song in data:
-                  url = song.get("url")
-
-                  if url:
-                      out.write(url + "\n")
-
-                      name = song.get("name", "Unknown")
-                      artist = song.get("artist", "Unknown")
-                      print(f"TRACK: {artist} - {name}")
-                      print(f"       {url}")
-          PY
+    if url and "open.spotify.com/track/" in url:
+        print(url)
+PY
 
           done < urls.txt
 
+          # Remove duplicate URLs.
           sort -u /tmp/track-urls.txt -o /tmp/track-urls.txt
 
-          echo ""
-          echo "========================================"
+          echo
           echo "Resolved tracks:"
-          echo "========================================"
-
           wc -l /tmp/track-urls.txt
-          cat /tmp/track-urls.txt
 
-      - name: Download each track with explicit fallback
+          if [ -s /tmp/resolution-failures.txt ]; then
+            echo
+            echo "Resolution failures:"
+            cat /tmp/resolution-failures.txt
+          fi
+
+      # ------------------------------------------------------------
+      # Download each track.
+      #
+      # IMPORTANT:
+      # Do NOT use spotDL's --archive here.
+      #
+      # spotDL can update its archive even when a provider attempt
+      # ultimately fails. We maintain archive.txt ourselves and only
+      # add a URL after verifying that a playable MP3 exists.
+      # ------------------------------------------------------------
+
+      - name: Download tracks with provider fallback
         env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
         run: |
           set -u
 
-          failed=0
+          had_failures=0
 
           while IFS= read -r track || [ -n "$track" ]; do
+
             [ -z "${track//[[:space:]]/}" ] && continue
 
-            echo ""
+            echo
             echo "########################################"
             echo "TRACK"
             echo "$track"
             echo "########################################"
 
+            # ------------------------------------------------------
+            # Skip tracks that have already been verified as
+            # successfully downloaded by this workflow.
+            # ------------------------------------------------------
+
+            if grep -Fqx "$track" archive.txt; then
+              echo "Already in archive.txt; skipping."
+              continue
+            fi
+
             success=0
+            successful_file=""
 
-            # --------------------------------------------------
-            # Provider 1: SoundCloud
-            # --------------------------------------------------
+            # ------------------------------------------------------
+            # Try providers in order.
+            #
+            # URL MUST appear before --audio because --audio accepts
+            # multiple provider arguments.
+            # ------------------------------------------------------
 
-            echo ""
-            echo "Trying SoundCloud..."
+            for provider in soundcloud bandcamp piped; do
 
-            if spotdl download "$track" \
-              --client-id "$SPOTIFY_CLIENT_ID" \
-              --client-secret "$SPOTIFY_CLIENT_SECRET" \
-              --audio soundcloud \
-              --format mp3 \
-              --bitrate 128k \
-              --output "/tmp/music-downloads/{artist}/{album}/{track-number} - {title}.{output-ext}" \
-              --overwrite skip \
-              --archive archive.txt \
-              --max-retries 2 \
-              --threads 1 \
-              --print-errors
-            then
-              echo "SoundCloud succeeded."
-              success=1
-            else
-              echo "SoundCloud failed."
-            fi
+              echo
+              echo "----------------------------------------"
+              echo "Trying provider: $provider"
+              echo "----------------------------------------"
+
+              # Snapshot existing MP3 files.
+              find /tmp/music-downloads \
+                -type f \
+                -iname '*.mp3' \
+                -printf '%p\n' \
+                | sort > /tmp/before-mp3.txt
+
+              # spotDL may return success even when an internal
+              # provider error was printed, so do not trust its
+              # exit status by itself.
+              spotdl download "$track" \
+                --client-id "$SPOTIFY_CLIENT_ID" \
+                --client-secret "$SPOTIFY_CLIENT_SECRET" \
+                --audio "$provider" \
+                --format "$AUDIO_FORMAT" \
+                --bitrate "$AUDIO_BITRATE" \
+                --output "/tmp/music-downloads/{artist}/{album}/{track-number} - {title}.{output-ext}" \
+                --overwrite skip \
+                --max-retries 2 \
+                --threads 1 \
+                --print-errors \
+                || true
+
+              # Find files created by this attempt.
+              find /tmp/music-downloads \
+                -type f \
+                -iname '*.mp3' \
+                -printf '%p\n' \
+                | sort > /tmp/after-mp3.txt
+
+              comm -13 \
+                /tmp/before-mp3.txt \
+                /tmp/after-mp3.txt \
+                > /tmp/new-mp3.txt
+
+              # ----------------------------------------------------
+              # Validate every newly created MP3 with ffprobe.
+              #
+              # This catches partial/corrupt files that happen to
+              # exist even though spotDL/provider processing failed.
+              # ----------------------------------------------------
+
+              while IFS= read -r candidate || [ -n "$candidate" ]; do
+
+                [ -z "$candidate" ] && continue
+
+                if [ ! -s "$candidate" ]; then
+                  continue
+                fi
+
+                if ffprobe \
+                  -v error \
+                  -select_streams a:0 \
+                  -show_entries stream=duration \
+                  -of default=noprint_wrappers=1:nokey=1 \
+                  "$candidate" \
+                  > /tmp/duration.txt 2>/dev/null
+                then
+
+                  duration=$(tr -d '\r\n' < /tmp/duration.txt)
+
+                  if awk "BEGIN { exit !($duration > 5) }"; then
+                    successful_file="$candidate"
+                    success=1
+                    break
+                  fi
+                fi
+
+              done < /tmp/new-mp3.txt
+
+              if [ "$success" -eq 1 ]; then
+                echo
+                echo "$provider succeeded."
+                echo "Verified audio file:"
+                echo "$successful_file"
+                break
+              fi
+
+              echo "$provider did not produce a verified playable MP3."
+
+            done
+
+            # ------------------------------------------------------
+            # Record success/failure.
+            # ------------------------------------------------------
 
             if [ "$success" -eq 1 ]; then
-              continue
-            fi
 
-            # --------------------------------------------------
-            # Provider 2: Bandcamp
-            # --------------------------------------------------
+              echo
+              echo "TRACK SUCCESS"
+              echo "$track"
 
-            echo ""
-            echo "Trying Bandcamp..."
+              # This is our authoritative archive.
+              echo "$track" >> archive.txt
 
-            if spotdl download "$track" \
-              --client-id "$SPOTIFY_CLIENT_ID" \
-              --client-secret "$SPOTIFY_CLIENT_SECRET" \
-              --audio bandcamp \
-              --format mp3 \
-              --bitrate 128k \
-              --output "/tmp/music-downloads/{artist}/{album}/{track-number} - {title}.{output-ext}" \
-              --overwrite skip \
-              --archive archive.txt \
-              --max-retries 2 \
-              --threads 1 \
-              --print-errors
-            then
-              echo "Bandcamp succeeded."
-              success=1
+              printf '%s\n' "$track" >> /tmp/successful-tracks.txt
+
             else
-              echo "Bandcamp failed."
+
+              echo
+              echo "ALL PROVIDERS FAILED"
+              echo "$track"
+
+              timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+              printf '%s | %s\n' \
+                "$timestamp" \
+                "$track" >> failed.txt
+
+              had_failures=1
             fi
-
-            if [ "$success" -eq 1 ]; then
-              continue
-            fi
-
-            # --------------------------------------------------
-            # Provider 3: Piped
-            # --------------------------------------------------
-
-            echo ""
-            echo "Trying Piped..."
-
-            if spotdl download "$track" \
-              --client-id "$SPOTIFY_CLIENT_ID" \
-              --client-secret "$SPOTIFY_CLIENT_SECRET" \
-              --audio piped \
-              --format mp3 \
-              --bitrate 128k \
-              --output "/tmp/music-downloads/{artist}/{album}/{track-number} - {title}.{output-ext}" \
-              --overwrite skip \
-              --archive archive.txt \
-              --max-retries 2 \
-              --threads 1 \
-              --print-errors
-            then
-              echo "Piped succeeded."
-              success=1
-            else
-              echo "Piped failed."
-            fi
-
-            if [ "$success" -eq 1 ]; then
-              continue
-            fi
-
-            # --------------------------------------------------
-            # Everything failed
-            # --------------------------------------------------
-
-            echo ""
-            echo "ALL PROVIDERS FAILED:"
-            echo "$track"
-
-            echo "$track" >> failed.txt
-            failed=1
 
           done < /tmp/track-urls.txt
 
-          exit "$failed"
+          # Keep archive unique and deterministic.
+          sort -u archive.txt -o archive.txt
+
+          echo
+          echo "========================================"
+          echo "DOWNLOAD SUMMARY"
+          echo "========================================"
+
+          echo
+          echo "Successful tracks:"
+          if [ -s /tmp/successful-tracks.txt ]; then
+            wc -l /tmp/successful-tracks.txt
+          else
+            echo "0"
+          fi
+
+          echo
+          echo "Failed tracks:"
+          if [ -s failed.txt ]; then
+            tail -n 50 failed.txt
+          else
+            echo "0"
+          fi
+
+          # Persist this for the library step.
+          if [ "$had_failures" -eq 1 ]; then
+            echo "1" > /tmp/had-download-failures
+          else
+            echo "0" > /tmp/had-download-failures
+          fi
+
+      # ------------------------------------------------------------
+      # Show downloaded files
+      # ------------------------------------------------------------
 
       - name: Show downloaded files
-        if: always()
         run: |
-          echo ""
-          echo "========================================"
-          echo "Downloaded files"
-          echo "========================================"
+          echo "Downloaded audio:"
+          find /tmp/music-downloads \
+            -type f \
+            -iname '*.mp3' \
+            -printf '%p (%s bytes)\n' \
+            | sort || true
 
-          if [ -d /tmp/music-downloads ]; then
-            find /tmp/music-downloads -type f -print | sort
-          else
-            echo "No download directory."
-          fi
+      # ------------------------------------------------------------
+      # Push music into the numbered private library repositories.
+      #
+      # The current repository is reused until its audio content
+      # reaches 4.5 GiB.
+      #
+      # If the next file would exceed the threshold:
+      #
+      #   current repo -> commit/push
+      #   create next repo
+      #   continue there
+      #
+      # Existing LFS files are NOT downloaded when cloning.
+      # Their pointer files are enough for Git to operate.
+      # ------------------------------------------------------------
 
-      - name: Show failure log
-        if: always()
-        run: |
-          echo ""
-          echo "========================================"
-          echo "Failed tracks"
-          echo "========================================"
-
-          if [ -s failed.txt ]; then
-            cat failed.txt
-          else
-            echo "No failed tracks."
-          fi
-
-      - name: Check library repository
-        if: always()
+      - name: Push music to numbered library repositories
         env:
           GIT_PAT: ${{ secrets.GIT_PAT }}
+          LIBRARY_OWNER: ${{ env.LIBRARY_OWNER }}
+          LIBRARY_PREFIX: ${{ env.LIBRARY_PREFIX }}
+          START_LIBRARY_NUMBER: ${{ env.START_LIBRARY_NUMBER }}
+          LIBRARY_LIMIT_BYTES: ${{ env.LIBRARY_LIMIT_BYTES }}
         run: |
-          set -e
+          set -euo pipefail
 
-          rm -rf /tmp/music-library
+          API="https://api.github.com"
+          API_VERSION="2026-03-10"
 
-          GIT_LFS_SKIP_SMUDGE=1 git clone \
-            "https://x-access-token:${GIT_PAT}@github.com/donbt256/music-library-001.git" \
-            /tmp/music-library
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          cd /tmp/music-library
+          export GIT_TERMINAL_PROMPT=0
 
-          git lfs install
+          # --------------------------------------------------------
+          # Helper: API request headers
+          # --------------------------------------------------------
 
-          echo ""
-          echo "Library repository:"
-          git remote -v
+          api_get() {
+            curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GIT_PAT}" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "$1"
+          }
 
-      - name: Copy downloads into library
-        if: always()
-        run: |
-          set -e
+          api_post() {
+            curl -fsSL \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GIT_PAT}" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              -H "Content-Type: application/json" \
+              "$1" \
+              -d "$2"
+          }
 
-          if [ ! -d /tmp/music-downloads ]; then
-            echo "No downloads directory."
-            exit 0
+          # --------------------------------------------------------
+          # Find the highest existing music-library-NNN repository.
+          # --------------------------------------------------------
+
+          highest_number=0
+
+          page=1
+
+          while true; do
+
+            repos=$(api_get \
+              "${API}/user/repos?visibility=all&affiliation=owner&per_page=100&page=${page}")
+
+            count=$(printf '%s' "$repos" | jq 'length')
+
+            [ "$count" -eq 0 ] && break
+
+            while IFS= read -r repo_name; do
+
+              if [[ "$repo_name" =~ ^${LIBRARY_PREFIX}([0-9]+)$ ]]; then
+
+                number="${BASH_REMATCH[1]}"
+
+                # Remove leading zeroes safely.
+                number=$((10#$number))
+
+                if [ "$number" -gt "$highest_number" ]; then
+                  highest_number="$number"
+                fi
+              fi
+
+            done < <(
+              printf '%s' "$repos" |
+              jq -r '.[].name'
+            )
+
+            page=$((page + 1))
+
+          done
+
+          if [ "$highest_number" -lt "$((10#$START_LIBRARY_NUMBER))" ]; then
+            highest_number="$((10#$START_LIBRARY_NUMBER))"
           fi
 
-          if [ -z "$(find /tmp/music-downloads -type f -print -quit)" ]; then
+          current_number="$highest_number"
+
+          printf -v current_repo "%s%03d" \
+            "$LIBRARY_PREFIX" \
+            "$current_number"
+
+          echo
+          echo "Highest existing library number: $current_number"
+          echo "Starting repository: $current_repo"
+
+          # --------------------------------------------------------
+          # Create a repository if it does not exist.
+          # --------------------------------------------------------
+
+          ensure_repo() {
+            local repo="$1"
+
+            if api_get "${API}/repos/${LIBRARY_OWNER}/${repo}" >/dev/null 2>&1; then
+              echo "Repository already exists: ${repo}"
+              return 0
+            fi
+
+            echo
+            echo "Creating private repository: ${repo}"
+
+            body=$(jq -n \
+              --arg name "$repo" \
+              '{
+                name: $name,
+                private: true,
+                description: "Music library",
+                has_issues: false,
+                has_projects: false,
+                has_wiki: false,
+                has_discussions: false,
+                has_downloads: true,
+                auto_init: false
+              }'
+            )
+
+            api_post "${API}/user/repos" "$body" >/dev/null
+
+            echo "Created: ${repo}"
+          }
+
+          # --------------------------------------------------------
+          # Clone one library repository.
+          #
+          # GIT_LFS_SKIP_SMUDGE=1 prevents downloading existing audio.
+          # --------------------------------------------------------
+
+          clone_library() {
+
+            local repo="$1"
+
+            ensure_repo "$repo"
+
+            rm -rf /tmp/library
+
+            echo
+            echo "Cloning ${repo} without downloading existing LFS files..."
+
+            GIT_LFS_SKIP_SMUDGE=1 git clone \
+              "https://x-access-token:${GIT_PAT}@github.com/${LIBRARY_OWNER}/${repo}.git" \
+              /tmp/library
+
+            cd /tmp/library
+
+            git lfs install --local
+
+            # Make sure MP3 files use LFS.
+            git lfs track "*.mp3" >/dev/null
+
+            git add .gitattributes
+
+            # If the repo is completely empty, this stages only
+            # .gitattributes. We do not push it yet.
+            git diff --cached --quiet || \
+              git commit -m "Configure Git LFS for MP3 files"
+
+          }
+
+          # --------------------------------------------------------
+          # Calculate existing LFS audio size.
+          #
+          # --debug gives the exact byte count without downloading
+          # the LFS objects.
+          # --------------------------------------------------------
+
+          get_library_size() {
+
+            cd /tmp/library
+
+            if [ -f .library-size-bytes ]; then
+              cat .library-size-bytes
+              return 0
+            fi
+
+            size=$(
+              git lfs ls-files --debug 2>/dev/null |
+              awk '
+                /^    size:/ {
+                  total += $2
+                }
+                END {
+                  print total + 0
+                }
+              '
+            )
+
+            echo "${size:-0}"
+          }
+
+          # --------------------------------------------------------
+          # Count tracked audio files.
+          # --------------------------------------------------------
+
+          has_library_audio() {
+
+            cd /tmp/library
+
+            if git lfs ls-files -n 2>/dev/null | grep -q '\.mp3$'; then
+              return 0
+            fi
+
+            return 1
+          }
+
+          # --------------------------------------------------------
+          # Push the current repository.
+          # --------------------------------------------------------
+
+          push_current_library() {
+
+            cd /tmp/library
+
+            local size="$1"
+
+            echo
+            echo "========================================"
+            echo "PUSHING ${current_repo}"
+            echo "Audio size: ${size} bytes"
+            echo "========================================"
+
+            printf '%s\n' "$size" > .library-size-bytes
+
+            git add .gitattributes .library-size-bytes
+
+            if ! git diff --cached --quiet; then
+              git commit -m "Update music library"
+            fi
+
+            # Add any music files not already staged.
+            git add .
+
+            if ! git diff --cached --quiet; then
+              git commit -m "Add downloaded music"
+            fi
+
+            git lfs push origin main
+
+            git push origin main
+
+            echo "Pushed ${current_repo}."
+          }
+
+          # --------------------------------------------------------
+          # If there are no downloads, don't touch the library.
+          # --------------------------------------------------------
+
+          if ! find /tmp/music-downloads \
+            -type f \
+            -iname '*.mp3' \
+            -print -quit |
+            grep -q .
+          then
+
+            echo
             echo "No new music was downloaded."
             exit 0
           fi
 
-          cp -a /tmp/music-downloads/. /tmp/music-library/
+          # --------------------------------------------------------
+          # Start with the newest repository.
+          # --------------------------------------------------------
 
-      - name: Configure Git LFS
+          clone_library "$current_repo"
+
+          current_size=$(get_library_size)
+
+          echo
+          echo "Current ${current_repo} audio size:"
+          echo "$current_size bytes"
+
+          # --------------------------------------------------------
+          # Process each newly downloaded MP3 individually.
+          #
+          # Files are assigned to repositories based on their actual
+          # byte size.
+          # --------------------------------------------------------
+
+          while IFS= read -r audio_file || [ -n "$audio_file" ]; do
+
+            [ -z "$audio_file" ] && continue
+            [ -f "$audio_file" ] || continue
+
+            file_size=$(stat -c '%s' "$audio_file")
+
+            echo
+            echo "========================================"
+            echo "Music file:"
+            echo "$audio_file"
+            echo "Size:"
+            echo "$file_size bytes"
+            echo "Current repo:"
+            echo "$current_repo"
+            echo "Current library size:"
+            echo "$current_size bytes"
+            echo "========================================"
+
+            projected_size=$((current_size + file_size))
+
+            # ------------------------------------------------------
+            # Rollover if this file would push the repository past
+            # the 4.5 GiB safety threshold.
+            #
+            # If the repository is empty, allow a single file larger
+            # than the threshold rather than looping forever.
+            # ------------------------------------------------------
+
+            if [ "$current_size" -gt 0 ] &&
+               [ "$projected_size" -gt "$LIBRARY_LIMIT_BYTES" ]; then
+
+              echo
+              echo "Rollover required."
+
+              push_current_library "$current_size"
+
+              current_number=$((current_number + 1))
+
+              printf -v current_repo "%s%03d" \
+                "$LIBRARY_PREFIX" \
+                "$current_number"
+
+              echo
+              echo "Rolling over to ${current_repo}"
+
+              clone_library "$current_repo"
+
+              current_size=$(get_library_size)
+
+            fi
+
+            # ------------------------------------------------------
+            # Determine the relative path.
+            #
+            # spotDL has already organized files as:
+            #
+            # Artist/Album/Track - Title.mp3
+            #
+            # Preserve that structure inside the library.
+            # ------------------------------------------------------
+
+            relative_path="${audio_file#/tmp/music-downloads/}"
+
+            destination="/tmp/library/${relative_path}"
+
+            mkdir -p "$(dirname "$destination")"
+
+            # If a file with exactly the same path already exists,
+            # compare sizes. This prevents accidental overwrite.
+            if [ -f "$destination" ]; then
+
+              existing_size=$(stat -c '%s' "$destination")
+
+              if [ "$existing_size" -eq "$file_size" ]; then
+
+                echo
+                echo "File already exists in library:"
+                echo "$relative_path"
+
+                rm -f "$audio_file"
+
+                continue
+
+              else
+
+                echo
+                echo "WARNING: same path exists with different size."
+                echo "Existing: $existing_size"
+                echo "New:      $file_size"
+
+                # Use a unique filename rather than overwriting.
+                base="${destination%.mp3}"
+                destination="${base} [${current_number}].mp3"
+                relative_path="${destination#/tmp/library/}"
+
+              fi
+            fi
+
+            cp -p "$audio_file" "$destination"
+
+            current_size=$((current_size + file_size))
+
+            echo
+            echo "Added to ${current_repo}:"
+            echo "$relative_path"
+
+            echo "New library size:"
+            echo "$current_size bytes"
+
+          done < <(
+            find /tmp/music-downloads \
+              -type f \
+              -iname '*.mp3' \
+              -print |
+            sort
+          )
+
+          # --------------------------------------------------------
+          # Final push.
+          # --------------------------------------------------------
+
+          push_current_library "$current_size"
+
+          echo
+          echo "========================================"
+          echo "LIBRARY COMPLETE"
+          echo "========================================"
+
+          echo "Final repository: ${current_repo}"
+          echo "Final audio size: ${current_size} bytes"
+
+      # ------------------------------------------------------------
+      # Update archive/failure state in the downloader repository.
+      # ------------------------------------------------------------
+
+      - name: Update downloader state
         if: always()
-        working-directory: /tmp/music-library
-        run: |
-          set -e
-
-          git lfs install
-
-          cat > .gitattributes <<'EOF'
-          *.mp3 filter=lfs diff=lfs merge=lfs -text
-          *.flac filter=lfs diff=lfs merge=lfs -text
-          *.m4a filter=lfs diff=lfs merge=lfs -text
-          *.ogg filter=lfs diff=lfs merge=lfs -text
-          *.opus filter=lfs diff=lfs merge=lfs -text
-          *.wav filter=lfs diff=lfs merge=lfs -text
-          EOF
-
-      - name: Commit library
-        if: always()
-        working-directory: /tmp/music-library
-        run: |
-          set -e
-
-          git config user.name "spot-downloader"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add .gitattributes
-          git add .
-
-          if git diff --cached --quiet; then
-            echo "Nothing new to commit."
-            exit 0
-          fi
-
-          git commit -m "Add downloaded music"
-
-      - name: Push library
-        if: always()
-        working-directory: /tmp/music-library
         env:
           GIT_PAT: ${{ secrets.GIT_PAT }}
         run: |
-          set -e
+          set -euo pipefail
 
-          git push origin main
-
-      - name: Commit downloader state
-        if: always()
-        env:
-          GIT_PAT: ${{ secrets.GIT_PAT }}
-        run: |
-          set -e
-
-          git config user.name "spot-downloader"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Remove any accidental duplicate archive entries.
+          sort -u archive.txt -o archive.txt
 
           git add archive.txt failed.txt
 
@@ -379,4 +831,40 @@ jobs:
           fi
 
           git commit -m "Update download state"
-          git push
+
+          git remote set-url origin \
+            "https://x-access-token:${GIT_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+
+          git pull --rebase origin main
+
+          git push origin main
+
+      # ------------------------------------------------------------
+      # Report partial failures.
+      #
+      # This is deliberately the LAST step so library/state commits
+      # still happen even when some providers fail.
+      # ------------------------------------------------------------
+
+      - name: Report download failures
+        if: always()
+        run: |
+          if [ -f /tmp/had-download-failures ] &&
+             [ "$(cat /tmp/had-download-failures)" = "1" ]; then
+
+            echo
+            echo "Some tracks failed with all configured providers."
+            echo "See failed.txt for the failure log."
+
+          fi
+
+          if [ -s /tmp/resolution-failures.txt ]; then
+            echo
+            echo "Some Spotify URLs could not be resolved."
+            cat /tmp/resolution-failures.txt
+          fi
+
+          # Do not fail the workflow solely because an individual
+          # provider was unavailable. The failed tracks remain in
+          # failed.txt and can be retried on the next run.
+          exit 0
