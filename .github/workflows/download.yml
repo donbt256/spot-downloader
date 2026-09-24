@@ -7,30 +7,111 @@ permissions:
   contents: write
 
 jobs:
-  test:
+  download:
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out downloader
         uses: actions/checkout@v4
 
-      - name: Check GitHub PAT
-        env:
-          GIT_PAT: ${{ secrets.GIT_PAT }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install FFmpeg
         run: |
-          set -e
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
-          response=$(curl -fsS \
-            -H "Authorization: Bearer $GIT_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            https://api.github.com/user)
+      - name: Install spotDL
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "spotdl==4.5.2"
 
-          echo "$response" | python -c '
-          import json, sys
-          data = json.load(sys.stdin)
-          print("Authenticated as:", data["login"])
-          '
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Check installed versions
+        run: |
+          python --version
+          ffmpeg -version | head -n 1
+          deno --version
+          spotdl --version
+
+      - name: Prepare download directory
+        run: |
+          rm -rf /tmp/music-downloads
+          mkdir -p /tmp/music-downloads
+
+      - name: Download music
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+        run: |
+          set -u
+
+          if [ ! -s urls.txt ]; then
+            echo "urls.txt is empty."
+            exit 1
+          fi
+
+          failed=0
+
+          while IFS= read -r url || [ -n "$url" ]; do
+            # Ignore blank lines.
+            [ -z "${url//[[:space:]]/}" ] && continue
+
+            # Ignore comments.
+            case "$url" in
+              \#*) continue ;;
+            esac
+
+            echo ""
+            echo "========================================"
+            echo "Downloading:"
+            echo "$url"
+            echo "========================================"
+
+            if ! spotdl download "$url" \
+              --client-id "$SPOTIFY_CLIENT_ID" \
+              --client-secret "$SPOTIFY_CLIENT_SECRET" \
+              --audio soundcloud bandcamp piped \
+              --format mp3 \
+              --bitrate 128k \
+              --output "/tmp/music-downloads/{artist}/{album}/{track-number} - {title}.{output-ext}" \
+              --overwrite skip \
+              --archive archive.txt \
+              --save-errors failed.txt \
+              --max-retries 3 \
+              --threads 4 \
+              --print-errors
+            then
+              echo "FAILED: $url"
+              failed=1
+            fi
+
+          done < urls.txt
+
+          exit "$failed"
+
+      - name: Show downloaded files
+        if: always()
+        run: |
+          echo "Downloaded files:"
+          find /tmp/music-downloads -type f -print | sort || true
+
+      - name: Show failure log
+        if: always()
+        run: |
+          if [ -f failed.txt ]; then
+            echo "Failure log:"
+            cat failed.txt
+          else
+            echo "No failure log."
+          fi
 
       - name: Check library repository
         env:
@@ -38,21 +119,90 @@ jobs:
         run: |
           set -e
 
-          curl -fsS \
-            -H "Authorization: Bearer $GIT_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            https://api.github.com/repos/donbt256/music-library-001 \
-            > /tmp/library.json
+          git clone \
+            "https://x-access-token:${GIT_PAT}@github.com/donbt256/music-library-001.git" \
+            /tmp/music-library
 
-          python - <<'PY'
-          import json
+          cd /tmp/music-library
 
-          with open("/tmp/library.json") as f:
-              repo = json.load(f)
+          git lfs install
 
-          print("Library repository:", repo["full_name"])
-          print("Private:", repo["private"])
-          print("Default branch:", repo["default_branch"])
-          print("Size:", repo["size"], "KB")
-          PY
+          echo "Library repository:"
+          git remote -v
+
+          echo ""
+          echo "Current contents:"
+          find . -maxdepth 3 -type f \
+            ! -path './.git/*' \
+            -print | sort | head -100
+
+      - name: Copy downloads into library
+        if: success()
+        run: |
+          set -e
+
+          if [ ! -d /tmp/music-downloads ] || \
+             [ -z "$(find /tmp/music-downloads -type f -print -quit)" ]; then
+            echo "No new music was downloaded."
+            exit 0
+          fi
+
+          cp -a /tmp/music-downloads/. /tmp/music-library/
+
+      - name: Configure Git LFS
+        if: success()
+        working-directory: /tmp/music-library
+        run: |
+          git lfs install
+
+          cat > .gitattributes <<'EOF'
+          *.mp3 filter=lfs diff=lfs merge=lfs -text
+          *.flac filter=lfs diff=lfs merge=lfs -text
+          *.m4a filter=lfs diff=lfs merge=lfs -text
+          *.ogg filter=lfs diff=lfs merge=lfs -text
+          *.opus filter=lfs diff=lfs merge=lfs -text
+          *.wav filter=lfs diff=lfs merge=lfs -text
+          EOF
+
+      - name: Commit library
+        if: success()
+        working-directory: /tmp/music-library
+        run: |
+          git config user.name "spot-downloader"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .gitattributes
+          git add '*.mp3' '*.flac' '*.m4a' '*.ogg' '*.opus' '*.wav' 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "Nothing new to commit."
+            exit 0
+          fi
+
+          git commit -m "Add downloaded music"
+
+      - name: Push library
+        if: success()
+        working-directory: /tmp/music-library
+        env:
+          GIT_PAT: ${{ secrets.GIT_PAT }}
+        run: |
+          set -e
+
+          git push origin main
+
+      - name: Commit downloader state
+        if: always()
+        run: |
+          git config user.name "spot-downloader"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add archive.txt failed.txt 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No downloader state changes."
+            exit 0
+          fi
+
+          git commit -m "Update download state"
+          git push
