@@ -19,10 +19,11 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install FFmpeg
+      - name: Install FFmpeg and Git LFS
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg git-lfs
+          git lfs install
 
       - name: Install spotDL
         run: |
@@ -40,86 +41,252 @@ jobs:
           ffmpeg -version | head -n 1
           deno --version
           spotdl --version
+          git lfs version
 
-      - name: Prepare download directory
+      - name: Prepare directories
         run: |
           rm -rf /tmp/music-downloads
           mkdir -p /tmp/music-downloads
 
-      - name: Download music
+          rm -f /tmp/all-tracks.json
+          rm -f /tmp/track-urls.txt
+
+          touch archive.txt
+          touch failed.txt
+
+      - name: Resolve Spotify URLs into individual tracks
         env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
         run: |
           set -u
 
-          if [ ! -s urls.txt ]; then
-            echo "urls.txt is empty."
-            exit 1
-          fi
-
-          failed=0
+          : > /tmp/track-urls.txt
 
           while IFS= read -r url || [ -n "$url" ]; do
-            # Ignore blank lines.
             [ -z "${url//[[:space:]]/}" ] && continue
 
-            # Ignore comments.
             case "$url" in
               \#*) continue ;;
             esac
 
             echo ""
             echo "========================================"
-            echo "Downloading:"
+            echo "Resolving:"
             echo "$url"
             echo "========================================"
 
-            if ! spotdl download "$url" \
+            rm -f /tmp/current.spotdl
+
+            if ! spotdl save "$url" \
               --client-id "$SPOTIFY_CLIENT_ID" \
               --client-secret "$SPOTIFY_CLIENT_SECRET" \
-              --audio soundcloud bandcamp piped \
+              --save-file /tmp/current.spotdl
+            then
+              echo "Could not resolve: $url"
+              echo "$url" >> failed.txt
+              continue
+            fi
+
+            python - <<'PY'
+          import json
+
+          path = "/tmp/current.spotdl"
+
+          with open(path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          if not isinstance(data, list):
+              raise SystemExit(f"Unexpected spotDL save format: {type(data)}")
+
+          with open("/tmp/track-urls.txt", "a", encoding="utf-8") as out:
+              for song in data:
+                  url = song.get("url")
+
+                  if url:
+                      out.write(url + "\n")
+
+                      name = song.get("name", "Unknown")
+                      artist = song.get("artist", "Unknown")
+                      print(f"TRACK: {artist} - {name}")
+                      print(f"       {url}")
+          PY
+
+          done < urls.txt
+
+          sort -u /tmp/track-urls.txt -o /tmp/track-urls.txt
+
+          echo ""
+          echo "========================================"
+          echo "Resolved tracks:"
+          echo "========================================"
+
+          wc -l /tmp/track-urls.txt
+          cat /tmp/track-urls.txt
+
+      - name: Download each track with explicit fallback
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+        run: |
+          set -u
+
+          failed=0
+
+          while IFS= read -r track || [ -n "$track" ]; do
+            [ -z "${track//[[:space:]]/}" ] && continue
+
+            echo ""
+            echo "########################################"
+            echo "TRACK"
+            echo "$track"
+            echo "########################################"
+
+            success=0
+
+            # --------------------------------------------------
+            # Provider 1: SoundCloud
+            # --------------------------------------------------
+
+            echo ""
+            echo "Trying SoundCloud..."
+
+            if spotdl download "$track" \
+              --client-id "$SPOTIFY_CLIENT_ID" \
+              --client-secret "$SPOTIFY_CLIENT_SECRET" \
+              --audio soundcloud \
               --format mp3 \
               --bitrate 128k \
               --output "/tmp/music-downloads/{artist}/{album}/{track-number} - {title}.{output-ext}" \
               --overwrite skip \
               --archive archive.txt \
-              --save-errors failed.txt \
-              --max-retries 3 \
-              --threads 4 \
+              --max-retries 2 \
+              --threads 1 \
               --print-errors
             then
-              echo "FAILED: $url"
-              failed=1
+              echo "SoundCloud succeeded."
+              success=1
+            else
+              echo "SoundCloud failed."
             fi
 
-          done < urls.txt
+            if [ "$success" -eq 1 ]; then
+              continue
+            fi
+
+            # --------------------------------------------------
+            # Provider 2: Bandcamp
+            # --------------------------------------------------
+
+            echo ""
+            echo "Trying Bandcamp..."
+
+            if spotdl download "$track" \
+              --client-id "$SPOTIFY_CLIENT_ID" \
+              --client-secret "$SPOTIFY_CLIENT_SECRET" \
+              --audio bandcamp \
+              --format mp3 \
+              --bitrate 128k \
+              --output "/tmp/music-downloads/{artist}/{album}/{track-number} - {title}.{output-ext}" \
+              --overwrite skip \
+              --archive archive.txt \
+              --max-retries 2 \
+              --threads 1 \
+              --print-errors
+            then
+              echo "Bandcamp succeeded."
+              success=1
+            else
+              echo "Bandcamp failed."
+            fi
+
+            if [ "$success" -eq 1 ]; then
+              continue
+            fi
+
+            # --------------------------------------------------
+            # Provider 3: Piped
+            # --------------------------------------------------
+
+            echo ""
+            echo "Trying Piped..."
+
+            if spotdl download "$track" \
+              --client-id "$SPOTIFY_CLIENT_ID" \
+              --client-secret "$SPOTIFY_CLIENT_SECRET" \
+              --audio piped \
+              --format mp3 \
+              --bitrate 128k \
+              --output "/tmp/music-downloads/{artist}/{album}/{track-number} - {title}.{output-ext}" \
+              --overwrite skip \
+              --archive archive.txt \
+              --max-retries 2 \
+              --threads 1 \
+              --print-errors
+            then
+              echo "Piped succeeded."
+              success=1
+            else
+              echo "Piped failed."
+            fi
+
+            if [ "$success" -eq 1 ]; then
+              continue
+            fi
+
+            # --------------------------------------------------
+            # Everything failed
+            # --------------------------------------------------
+
+            echo ""
+            echo "ALL PROVIDERS FAILED:"
+            echo "$track"
+
+            echo "$track" >> failed.txt
+            failed=1
+
+          done < /tmp/track-urls.txt
 
           exit "$failed"
 
       - name: Show downloaded files
         if: always()
         run: |
-          echo "Downloaded files:"
-          find /tmp/music-downloads -type f -print | sort || true
+          echo ""
+          echo "========================================"
+          echo "Downloaded files"
+          echo "========================================"
+
+          if [ -d /tmp/music-downloads ]; then
+            find /tmp/music-downloads -type f -print | sort
+          else
+            echo "No download directory."
+          fi
 
       - name: Show failure log
         if: always()
         run: |
-          if [ -f failed.txt ]; then
-            echo "Failure log:"
+          echo ""
+          echo "========================================"
+          echo "Failed tracks"
+          echo "========================================"
+
+          if [ -s failed.txt ]; then
             cat failed.txt
           else
-            echo "No failure log."
+            echo "No failed tracks."
           fi
 
       - name: Check library repository
+        if: always()
         env:
           GIT_PAT: ${{ secrets.GIT_PAT }}
         run: |
           set -e
 
-          git clone \
+          rm -rf /tmp/music-library
+
+          GIT_LFS_SKIP_SMUDGE=1 git clone \
             "https://x-access-token:${GIT_PAT}@github.com/donbt256/music-library-001.git" \
             /tmp/music-library
 
@@ -127,22 +294,21 @@ jobs:
 
           git lfs install
 
+          echo ""
           echo "Library repository:"
           git remote -v
 
-          echo ""
-          echo "Current contents:"
-          find . -maxdepth 3 -type f \
-            ! -path './.git/*' \
-            -print | sort | head -100
-
       - name: Copy downloads into library
-        if: success()
+        if: always()
         run: |
           set -e
 
-          if [ ! -d /tmp/music-downloads ] || \
-             [ -z "$(find /tmp/music-downloads -type f -print -quit)" ]; then
+          if [ ! -d /tmp/music-downloads ]; then
+            echo "No downloads directory."
+            exit 0
+          fi
+
+          if [ -z "$(find /tmp/music-downloads -type f -print -quit)" ]; then
             echo "No new music was downloaded."
             exit 0
           fi
@@ -150,9 +316,11 @@ jobs:
           cp -a /tmp/music-downloads/. /tmp/music-library/
 
       - name: Configure Git LFS
-        if: success()
+        if: always()
         working-directory: /tmp/music-library
         run: |
+          set -e
+
           git lfs install
 
           cat > .gitattributes <<'EOF'
@@ -165,14 +333,16 @@ jobs:
           EOF
 
       - name: Commit library
-        if: success()
+        if: always()
         working-directory: /tmp/music-library
         run: |
+          set -e
+
           git config user.name "spot-downloader"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add .gitattributes
-          git add '*.mp3' '*.flac' '*.m4a' '*.ogg' '*.opus' '*.wav' 2>/dev/null || true
+          git add .
 
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
@@ -182,7 +352,7 @@ jobs:
           git commit -m "Add downloaded music"
 
       - name: Push library
-        if: success()
+        if: always()
         working-directory: /tmp/music-library
         env:
           GIT_PAT: ${{ secrets.GIT_PAT }}
@@ -193,11 +363,15 @@ jobs:
 
       - name: Commit downloader state
         if: always()
+        env:
+          GIT_PAT: ${{ secrets.GIT_PAT }}
         run: |
+          set -e
+
           git config user.name "spot-downloader"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add archive.txt failed.txt 2>/dev/null || true
+          git add archive.txt failed.txt
 
           if git diff --cached --quiet; then
             echo "No downloader state changes."
