@@ -2,739 +2,785 @@ name: Download Spotify Music
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - "urls.txt"
+      - ".github/workflows/download.yml"
   schedule:
-    - cron: "0 5 * * *"
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: spotify-music-downloader
+  cancel-in-progress: false
 
 permissions:
   contents: write
-
-env:
-  LIBRARY_OWNER: "donbt256"
-  LIBRARY_PREFIX: "music-library-"
-  LIBRARY_LIMIT_BYTES: "943718400"
-  AUDIO_FORMAT: "mp3"
-  AUDIO_BITRATE: "128k"
 
 jobs:
   download:
     runs-on: ubuntu-latest
 
+    env:
+      LIBRARY_LIMIT_BYTES: 943718400
+      OUTPUT_DIR: /tmp/music-downloads
+      QUARANTINE_DIR: /tmp/music-quarantine
+      VERIFIED_FILE: /tmp/verified-downloads.txt
+      FAILURES_FILE: /tmp/current-run-failures.txt
+      RESOLVED_FILE: /tmp/resolved-tracks.tsv
+
     steps:
-      - name: Check out downloader repository
+      - name: Check out downloader
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
 
       - name: Install spotDL
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install "spotdl==4.5.2"
 
       - name: Install Deno
         run: |
+          set -euo pipefail
           spotdl --download-deno
 
       - name: Prepare directories
         run: |
-          rm -rf /tmp/music-downloads
-          rm -rf /tmp/library
-          rm -rf /tmp/library-scan
+          set -euo pipefail
+          rm -rf "$OUTPUT_DIR" "$QUARANTINE_DIR"
+          mkdir -p "$OUTPUT_DIR" "$QUARANTINE_DIR"
+          : > "$VERIFIED_FILE"
+          : > "$FAILURES_FILE"
+          : > "$RESOLVED_FILE"
 
-          mkdir -p /tmp/music-downloads
-          mkdir -p /tmp/library-scan
-
-          touch archive.txt
-          touch failed.txt
-
-          : > /tmp/track-urls.txt
-          : > /tmp/resolution-failures.txt
-          : > /tmp/downloaded-tracks.txt
-          : > /tmp/verified-downloads.txt
-          : > /tmp/library-added-tracks.txt
-          : > /tmp/had-download-failures
-          : > /tmp/had-library-failures
-          : > /tmp/library-hashes.txt
-
-      - name: Resolve Spotify URLs
+      # Tier 1:
+      # - per-source processing/checkpoints
+      # - Spotify metadata as the canonical metadata source
+      # - mandatory track/disc numbering
+      # - provider fallback
+      # - audio validation and Spotify-duration verification
+      # - quarantine of suspicious downloads
+      # - cross-library MD5 duplicate detection
+      # - archive only after the corresponding library push succeeds
+      #
+      # This resolver creates a source manifest. Each input URL is processed
+      # independently so a completed album/playlist can be committed and pushed
+      # before the next one begins.
+      - name: Resolve Spotify sources
         env:
-          SPOTIFY_CLIENT_ID: "${{ secrets.SPOTIFY_CLIENT_ID }}"
-          SPOTIFY_CLIENT_SECRET: "${{ secrets.SPOTIFY_CLIENT_SECRET }}"
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
         run: |
-          set -u
+          set -euo pipefail
 
-          while IFS= read -r source || [ -n "$source" ]; do
-            source="${source#"${source%%[![:space:]]*}"}"
-            source="${source%"${source##*[![:space:]]}"}"
-
-            if [ -z "$source" ] || [[ "$source" == \#* ]]; then
-              continue
-            fi
-
-            echo ""
-            echo "========================================"
-            echo "Resolving:"
-            echo "$source"
-            echo "========================================"
-
-            rm -f /tmp/current.spotdl
-
-            if spotdl save "$source" \
-              --client-id "$SPOTIFY_CLIENT_ID" \
-              --client-secret "$SPOTIFY_CLIENT_SECRET" \
-              --save-file /tmp/current.spotdl
-            then
-              python -c 'import json; songs=json.load(open("/tmp/current.spotdl", encoding="utf-8")); [print(s["url"]) for s in songs if s.get("url") and "open.spotify.com/track/" in s["url"]]' \
-                >> /tmp/track-urls.txt
-            else
-              echo "Resolution failed:"
-              echo "$source"
-              printf "%s\n" "$source" >> /tmp/resolution-failures.txt
-            fi
-          done < urls.txt
-
-          sort -u /tmp/track-urls.txt -o /tmp/track-urls.txt
-
-          echo ""
-          echo "Resolved tracks:"
-          wc -l /tmp/track-urls.txt
-
-          if [ -s /tmp/resolution-failures.txt ]; then
-            echo ""
-            echo "Resolution failures:"
-            cat /tmp/resolution-failures.txt
+          if [[ ! -f urls.txt ]]; then
+            echo "urls.txt not found."
+            exit 1
           fi
 
-      - name: Download tracks
-        env:
-          SPOTIFY_CLIENT_ID: "${{ secrets.SPOTIFY_CLIENT_ID }}"
-          SPOTIFY_CLIENT_SECRET: "${{ secrets.SPOTIFY_CLIENT_SECRET }}"
-        run: |
-          set -u
+          source_index=0
 
-          had_failures=0
+          while IFS= read -r raw || [[ -n "$raw" ]]; do
+            raw="${raw#"${raw%%[![:space:]]*}"}"
+            raw="${raw%"${raw##*[![:space:]]}"}"
 
-          while IFS= read -r track || [ -n "$track" ]; do
-            if [ -z "${track//[[:space:]]/}" ]; then
-              continue
-            fi
+            [[ -z "$raw" ]] && continue
+            [[ "$raw" == \#* ]] && continue
 
-            echo ""
-            echo "########################################"
-            echo "TRACK"
-            echo "$track"
-            echo "########################################"
+            source_index=$((source_index + 1))
 
-            if grep -Fqx "$track" archive.txt; then
-              echo "Verified and archived. Skipping."
-              continue
-            fi
+            source_file="/tmp/source-${source_index}.txt"
+            source_url="$raw"
 
-            success=0
-            successful_file=""
+            echo "========================================"
+            echo "Resolving source #$source_index"
+            echo "$source_url"
+            echo "========================================"
 
-            for provider in soundcloud bandcamp piped; do
-              echo ""
-              echo "----------------------------------------"
-              echo "Trying $provider"
-              echo "----------------------------------------"
-
-              find /tmp/music-downloads \
-                -type f \
-                -iname "*.mp3" \
-                -printf "%p\n" \
-                | sort > /tmp/before-mp3.txt
-
-              spotdl download "$track" \
+            # spotDL's save command gives us Spotify's canonical track data.
+            # The JSON is retained for the processing step below.
+            if ! spotdl save "$source_url" \
                 --client-id "$SPOTIFY_CLIENT_ID" \
                 --client-secret "$SPOTIFY_CLIENT_SECRET" \
-                --audio "$provider" \
-                --format "$AUDIO_FORMAT" \
-                --bitrate "$AUDIO_BITRATE" \
-                --output "/tmp/music-downloads/{artist}/{album}/{track-number} - {title}.{output-ext}" \
-                --overwrite skip \
-                --max-retries 2 \
-                --threads 1 \
-                --print-errors \
-                || true
+                --save-file "$source_file.json"; then
+              echo "Could not resolve: $source_url" | tee -a "$FAILURES_FILE"
+              continue
+            fi
 
-              find /tmp/music-downloads \
-                -type f \
-                -iname "*.mp3" \
-                -printf "%p\n" \
-                | sort > /tmp/after-mp3.txt
+            jq -c \
+              --arg source_id "$source_index" \
+              --arg source_url "$source_url" \
+              '
+              if type == "array" then . else [.] end
+              | .[]
+              | {
+                  source_id: $source_id,
+                  source_url: $source_url,
+                  url: (.url // .spotify_url // ""),
+                  name: (.name // .title // ""),
+                  artist: (
+                    if (.artists | type) == "array"
+                    then (.artists | map(
+                      if type == "object" then (.name // "")
+                      else tostring
+                      end
+                    ) | join(", "))
+                    else (.artist // .artists // "")
+                    end
+                  ),
+                  album: (
+                    if (.album | type) == "object"
+                    then (.album.name // "")
+                    else (.album // "")
+                    end
+                  ),
+                  album_artist: (
+                    .album_artist //
+                    (if (.album | type) == "object"
+                     then (.album.artists // [] | map(
+                       if type == "object" then (.name // "")
+                       else tostring
+                       end
+                     ) | join(", "))
+                     else ""
+                     end)
+                  ),
+                  track_number: (
+                    .track_number //
+                    (.track_number_total | if . == null then null else 1 end)
+                  ),
+                  disc_number: (.disc_number // 1),
+                  duration_ms: (.duration_ms // .duration // null),
+                  release_date: (
+                    .release_date //
+                    (if (.album | type) == "object"
+                     then (.album.release_date // "")
+                     else ""
+                     end)
+                  ),
+                  year: (.year // ""),
+                  genre: (
+                    if (.genres | type) == "array"
+                    then (.genres | join(", "))
+                    else (.genre // "")
+                    end
+                  ),
+                  explicit: (.explicit // false),
+                  isrc: (.external_ids.isrc // .isrc // ""),
+                  cover_url: (
+                    .cover_url //
+                    .album_cover_url //
+                    .image //
+                    .images[0].url //
+                    (if (.album | type) == "object"
+                     then .album.images[0].url
+                     else ""
+                     end)
+                  )
+                }
+              | select(.url != "")
+              | @json
+              ' "$source_file.json" 2>/dev/null |
+              while IFS= read -r record; do
+                printf '%s\t%s\n' "$source_index" "$record" >> "$RESOLVED_FILE"
+              done
 
-              comm -13 \
-                /tmp/before-mp3.txt \
-                /tmp/after-mp3.txt \
-                > /tmp/new-mp3.txt
+          done < urls.txt
 
-              while IFS= read -r candidate || [ -n "$candidate" ]; do
-                if [ -z "$candidate" ] || [ ! -s "$candidate" ]; then
+          echo
+          echo "Resolved source/track records:"
+          wc -l "$RESOLVED_FILE" || true
+
+      - name: Process each Spotify source
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "$RESOLVED_FILE" ]]; then
+            echo "No tracks were resolved."
+            exit 0
+          fi
+
+          # Extract source IDs in their original order.
+          mapfile -t SOURCE_IDS < <(cut -f1 "$RESOLVED_FILE" | awk '!seen[$0]++')
+
+          for source_id in "${SOURCE_IDS[@]}"; do
+            echo
+            echo "############################################################"
+            echo "Processing Spotify source #$source_id"
+            echo "############################################################"
+
+            source_records="/tmp/source-${source_id}-records.tsv"
+            source_failures="/tmp/source-${source_id}-failures.txt"
+            source_verified="/tmp/source-${source_id}-verified.tsv"
+            source_staged="/tmp/source-${source_id}-staged.tsv"
+
+            : > "$source_records"
+            : > "$source_failures"
+            : > "$source_verified"
+            : > "$source_staged"
+
+            awk -F '\t' -v id="$source_id" '$1 == id {print $2}' \
+              "$RESOLVED_FILE" > "$source_records"
+
+            track_index=0
+
+            while IFS= read -r record; do
+              [[ -z "$record" ]] && continue
+
+              track_index=$((track_index + 1))
+
+              spotify_url="$(jq -r '.url' <<< "$record")"
+              title="$(jq -r '.name' <<< "$record")"
+              artist="$(jq -r '.artist' <<< "$record")"
+              album="$(jq -r '.album' <<< "$record")"
+              album_artist="$(jq -r '.album_artist' <<< "$record")"
+              track_number="$(jq -r '.track_number // 1' <<< "$record")"
+              disc_number="$(jq -r '.disc_number // 1' <<< "$record")"
+              duration_ms="$(jq -r '.duration_ms // 0' <<< "$record")"
+              release_date="$(jq -r '.release_date // ""' <<< "$record")"
+              year="$(jq -r '.year // ""' <<< "$record")"
+              genre="$(jq -r '.genre // ""' <<< "$record")"
+              explicit="$(jq -r '.explicit // false' <<< "$record")"
+              isrc="$(jq -r '.isrc // ""' <<< "$record")"
+              cover_url="$(jq -r '.cover_url // ""' <<< "$record")"
+
+              expected_seconds="0"
+              if [[ "$duration_ms" =~ ^[0-9]+$ ]] && (( duration_ms > 0 )); then
+                expected_seconds="$(awk -v ms="$duration_ms" 'BEGIN {printf "%.3f", ms/1000}')"
+              fi
+
+              safe_artist="$(printf '%s' "$artist" | tr '/:' '__')"
+              safe_album="$(printf '%s' "$album" | tr '/:' '__')"
+              safe_title="$(printf '%s' "$title" | tr '/:' '__')"
+
+              output_base="$OUTPUT_DIR/$safe_artist/$safe_album"
+              mkdir -p "$output_base"
+
+              echo
+              echo "Track $track_index"
+              echo "Spotify: $spotify_url"
+              echo "Canonical: $artist - $album - $title"
+
+              providers=("soundcloud" "bandcamp" "piped")
+              downloaded=""
+
+              for provider in "${providers[@]}"; do
+                echo "Trying provider: $provider"
+
+                provider_log="/tmp/provider-${source_id}-${track_index}-${provider}.log"
+
+                set +e
+                spotdl download "$spotify_url" \
+                  --client-id "$SPOTIFY_CLIENT_ID" \
+                  --client-secret "$SPOTIFY_CLIENT_SECRET" \
+                  --audio "$provider" \
+                  --output "$output_base/{track-number} - {title}.{output-ext}" \
+                  > >(tee "$provider_log") 2>&1
+                provider_status=$?
+                set -e
+
+                if (( provider_status != 0 )); then
+                  echo "Provider failed: $provider"
+
+                  if grep -Eiq \
+                    'DRM|protected|unavailable|no results|not found|does not exist|removed|private track|deleted' \
+                    "$provider_log"; then
+                    classification="permanent"
+                  elif grep -Eiq \
+                    '429|rate.?limit|timed out|timeout|temporar|5[0-9][0-9]|connection|network|503|502|504' \
+                    "$provider_log"; then
+                    classification="transient"
+                  else
+                    classification="unknown"
+                  fi
+
+                  printf '%s | source=%s | track=%s | provider=%s | class=%s | reason=provider failure\n' \
+                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    "$spotify_url" \
+                    "$title" \
+                    "$provider" \
+                    "$classification" >> "$source_failures"
+
                   continue
                 fi
 
-                if ffprobe \
-                  -v error \
-                  -select_streams a:0 \
-                  -show_entries stream=duration \
-                  -of default=noprint_wrappers=1:nokey=1 \
-                  "$candidate" \
-                  > /tmp/duration.txt 2>/dev/null
-                then
-                  duration=$(tr -d "\r\n" < /tmp/duration.txt)
+                candidate="$(find "$output_base" -maxdepth 1 -type f -iname '*.mp3' -printf '%T@ %p\n' \
+                  | sort -nr | head -n1 | cut -d' ' -f2- || true)"
 
-                  if awk "BEGIN { exit !($duration > 5) }"; then
-                    successful_file="$candidate"
-                    success=1
-                    break
+                if [[ -z "$candidate" || ! -f "$candidate" ]]; then
+                  echo "Provider returned success but no MP3 was found."
+                  continue
+                fi
+
+                # Tier 1 audio validation:
+                # 1. ffprobe must identify an audio stream.
+                # 2. Duration must be sane.
+                # 3. ffmpeg must be able to decode the file without errors.
+                codec="$(ffprobe -v error -select_streams a:0 \
+                  -show_entries stream=codec_name \
+                  -of default=noprint_wrappers=1:nokey=1 "$candidate" 2>/dev/null || true)"
+
+                actual_seconds="$(ffprobe -v error \
+                  -show_entries format=duration \
+                  -of default=noprint_wrappers=1:nokey=1 "$candidate" 2>/dev/null || true)"
+
+                if [[ "$codec" != "mp3" ]] || [[ -z "$actual_seconds" ]]; then
+                  echo "Invalid audio file; quarantining."
+                  mv -f "$candidate" "$QUARANTINE_DIR/$(basename "$candidate")" || true
+                  continue
+                fi
+
+                if ! awk -v d="$actual_seconds" 'BEGIN {exit !(d > 5)}'; then
+                  echo "Audio is suspiciously short; quarantining."
+                  mv -f "$candidate" "$QUARANTINE_DIR/$(basename "$candidate")" || true
+                  continue
+                fi
+
+                if ! ffmpeg -v error -i "$candidate" -f null - >/tmp/ffmpeg-check.log 2>&1; then
+                  echo "Audio failed full decode validation; quarantining."
+                  mv -f "$candidate" "$QUARANTINE_DIR/$(basename "$candidate")" || true
+                  continue
+                fi
+
+                # Compare the provider's duration against Spotify's expected duration.
+                # Allow a small absolute tolerance and a small percentage tolerance
+                # to account for intro/outro and encoding differences.
+                if [[ "$expected_seconds" != "0" ]]; then
+                  duration_ok="$(
+                    awk -v expected="$expected_seconds" -v actual="$actual_seconds" '
+                      BEGIN {
+                        diff = expected - actual
+                        if (diff < 0) diff = -diff
+                        tolerance = expected * 0.03
+                        if (tolerance < 5) tolerance = 5
+                        exit !(diff <= tolerance)
+                      }
+                    '
+                  )" || duration_ok=""
+
+                  if [[ -z "$duration_ok" ]]; then
+                    echo "Duration mismatch; quarantining."
+                    printf '%s | source=%s | track=%s | provider=%s | class=identity-mismatch | expected=%ss | actual=%ss\n' \
+                      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                      "$spotify_url" "$title" "$provider" \
+                      "$expected_seconds" "$actual_seconds" >> "$source_failures"
+                    mv -f "$candidate" "$QUARANTINE_DIR/$(basename "$candidate")" || true
+                    continue
                   fi
                 fi
-              done < /tmp/new-mp3.txt
 
-              if [ "$success" -eq 1 ]; then
-                echo ""
-                echo "$provider succeeded."
-                echo "Verified file:"
-                echo "$successful_file"
+                downloaded="$candidate"
+                echo "Validated download: $downloaded"
                 break
+              done
+
+              if [[ -z "$downloaded" ]]; then
+                echo "All providers failed for: $spotify_url"
+                continue
               fi
 
-              echo "$provider did not produce a verified MP3."
-            done
+              # Canonical Spotify metadata.
+              # The downloaded provider metadata is deliberately overwritten.
+              final_name="$(printf '%02d - %s.mp3' "$track_number" "$title")"
+              final_path="$output_base/$final_name"
 
-            if [ "$success" -eq 1 ]; then
-              echo ""
-              echo "TRACK DOWNLOAD SUCCESS"
+              if [[ "$downloaded" != "$final_path" ]]; then
+                mv -f "$downloaded" "$final_path"
+                downloaded="$final_path"
+              fi
 
-              printf "%s\t%s\n" \
-                "$track" \
-                "$successful_file" >> /tmp/verified-downloads.txt
-            else
-              echo ""
-              echo "ALL PROVIDERS FAILED"
+              release_year="$year"
+              if [[ -z "$release_year" && "$release_date" =~ ^([0-9]{4}) ]]; then
+                release_year="${BASH_REMATCH[1]}"
+              fi
 
-              timestamp=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+              explicit_text="No"
+              [[ "$explicit" == "true" ]] && explicit_text="Yes"
 
-              printf "%s | %s\n" \
-                "$timestamp" \
-                "$track" >> failed.txt
+              # ffmpeg metadata replacement. Spotify values are canonical.
+              metadata_tmp="${downloaded}.tmp.mp3"
 
-              had_failures=1
+              ffmpeg -y -v error -i "$downloaded" -map 0:a:0 \
+                -map_metadata -1 \
+                -c:a copy \
+                -metadata title="$title" \
+                -metadata artist="$artist" \
+                -metadata album="$album" \
+                -metadata album_artist="$album_artist" \
+                -metadata track="$track_number" \
+                -metadata disc="$disc_number" \
+                -metadata date="$release_date" \
+                -metadata year="$release_year" \
+                -metadata genre="$genre" \
+                -metadata compilation="$explicit_text" \
+                -metadata comment="Spotify canonical metadata; Spotify URL: $spotify_url" \
+                "$metadata_tmp"
+
+              mv -f "$metadata_tmp" "$downloaded"
+
+              # Optional Spotify artwork. Failure to retrieve artwork is non-fatal.
+              if [[ -n "$cover_url" && "$cover_url" != "null" ]]; then
+                cover_tmp="/tmp/cover-${source_id}-${track_index}.jpg"
+
+                if curl -L --fail --silent --show-error \
+                    --max-time 20 "$cover_url" -o "$cover_tmp"; then
+
+                  artwork_tmp="${downloaded}.art.mp3"
+
+                  if ffmpeg -y -v error \
+                      -i "$downloaded" \
+                      -i "$cover_tmp" \
+                      -map 0:a:0 \
+                      -map 1:v:0 \
+                      -map_metadata 0 \
+                      -c:a copy \
+                      -c:v mjpeg \
+                      -disposition:v attached_pic \
+                      "$artwork_tmp"; then
+                    mv -f "$artwork_tmp" "$downloaded"
+                  fi
+
+                  rm -f "$cover_tmp"
+                fi
+              fi
+
+              # Lyrics are intentionally not part of Tier 1 because they require
+              # an additional external lyrics provider and should remain optional.
+
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$spotify_url" \
+                "$downloaded" \
+                "$artist" \
+                "$album" \
+                "$album_artist" \
+                "$title" \
+                "$track_number" \
+                "$disc_number" \
+                "$release_date" \
+                "$genre" \
+                "$explicit" \
+                "$duration_ms" \
+                "$cover_url" \
+                "$isrc" \
+                "$source_id" >> "$source_verified"
+
+              printf '%s\n' "$spotify_url" >> "$VERIFIED_FILE"
+
+            done < "$source_records"
+
+            # Keep failures from this source in the global run report.
+            if [[ -s "$source_failures" ]]; then
+              cat "$source_failures" >> "$FAILURES_FILE"
             fi
-          done < /tmp/track-urls.txt
 
-          echo "$had_failures" > /tmp/had-download-failures
+            if [[ ! -s "$source_verified" ]]; then
+              echo "No verified downloads for source #$source_id."
+              continue
+            fi
 
-          echo ""
-          echo "========================================"
-          echo "DOWNLOAD SUMMARY"
-          echo "========================================"
+            echo
+            echo "Source #$source_id verified downloads:"
+            cat "$source_verified"
 
-          echo ""
-          echo "Verified downloads:"
-          if [ -s /tmp/verified-downloads.txt ]; then
-            wc -l /tmp/verified-downloads.txt
-          else
-            echo "0"
-          fi
+            # The actual library checkpoint is handled below, one source at a time.
+            cp "$source_verified" "$source_staged"
 
-          echo ""
-          echo "Failed tracks:"
-          if [ -s failed.txt ]; then
-            tail -n 50 failed.txt
-          else
-            echo "0"
-          fi
+            # Export the source state for the library step.
+            cp "$source_staged" "/tmp/current-source-staged.tsv"
 
-      - name: Show downloaded files
-        run: |
-          echo "Downloaded audio:"
+            if ! ./scripts/push-source-to-library.sh "$source_id" "$source_staged"; then
+              echo "Library checkpoint failed for source #$source_id"
+              echo "Tracks from this source remain unarchived and will be retried."
+              continue
+            fi
 
-          find /tmp/music-downloads \
-            -type f \
-            -iname "*.mp3" \
-            -printf "%p (%s bytes)\n" \
-            | sort || true
+            echo "Library checkpoint succeeded for source #$source_id"
 
-      - name: Push music to library repositories
-        env:
-          GIT_PAT: "${{ secrets.GIT_PAT }}"
+            # Archive ONLY tracks that made it through the successful library
+            # checkpoint. The helper writes them to this file.
+            if [[ -f "/tmp/source-${source_id}-archived.txt" ]]; then
+              cat "/tmp/source-${source_id}-archived.txt" >> archive.txt
+              sort -u archive.txt -o archive.txt
+            fi
+
+            # Clear successfully processed source files before continuing.
+            rm -f "$source_staged"
+
+          done
+
+      # This creates the helper used by the Tier 1 source checkpoint above.
+      - name: Install library checkpoint helper
         run: |
           set -euo pipefail
 
-          API="https://api.github.com"
-          API_VERSION="2022-11-28"
+          mkdir -p scripts
 
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cat > scripts/push-source-to-library.sh <<'HELPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
 
-          export GIT_TERMINAL_PROMPT=0
+          source_id="$1"
+          source_staged="$2"
 
-          api_get() {
-            curl -fsSL \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GIT_PAT}" \
-              -H "X-GitHub-Api-Version: ${API_VERSION}" \
-              "$1"
-          }
+          : "${LIBRARY_LIMIT_BYTES:?}"
+          : "${QUARANTINE_DIR:?}"
 
-          api_post() {
-            curl -fsSL \
-              -X POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GIT_PAT}" \
-              -H "X-GitHub-Api-Version: ${API_VERSION}" \
-              -H "Content-Type: application/json" \
-              "$1" \
-              -d "$2"
-          }
-
-          if [ ! -s /tmp/verified-downloads.txt ]; then
-            echo "No new verified music was downloaded."
+          if [[ ! -s "$source_staged" ]]; then
             exit 0
           fi
 
-          highest_number=0
+          token="${GIT_PAT:?}"
+          owner="donbt256"
+          repo_prefix="music-library"
+
+          api="https://api.github.com"
+
+          auth_headers=(
+            -H "Authorization: Bearer $token"
+            -H "Accept: application/vnd.github+json"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+
+          highest=0
           page=1
 
-          while true; do
-            repos=$(api_get \
-              "${API}/user/repos?visibility=all&affiliation=owner&per_page=100&page=${page}")
+          while :; do
+            response="$(curl -fsSL "${auth_headers[@]}" \
+              "$api/user/repos?per_page=100&page=$page")"
 
-            count=$(printf "%s" "$repos" | jq "length")
+            count="$(jq 'length' <<< "$response")"
+            (( count == 0 )) && break
 
-            if [ "$count" -eq 0 ]; then
-              break
-            fi
-
-            while IFS= read -r repo_name; do
-              if [[ "$repo_name" =~ ^${LIBRARY_PREFIX}([0-9]+)$ ]]; then
-                number="${BASH_REMATCH[1]}"
-                number=$((10#$number))
-
-                if [ "$number" -gt "$highest_number" ]; then
-                  highest_number="$number"
-                fi
+            while IFS= read -r name; do
+              if [[ "$name" =~ ^music-library-([0-9]{3})$ ]]; then
+                n="${BASH_REMATCH[1]}"
+                n=$((10#$n))
+                (( n > highest )) && highest="$n"
               fi
-            done < <(printf "%s" "$repos" | jq -r ".[].name")
+            done < <(jq -r '.[].name' <<< "$response")
 
+            (( count < 100 )) && break
             page=$((page + 1))
           done
 
-          if [ "$highest_number" -lt 1 ]; then
-            highest_number=1
-          fi
+          (( highest == 0 )) && highest=1
 
-          current_number="$highest_number"
+          library_dir="/tmp/library-work"
+          rm -rf "$library_dir"
+          mkdir -p "$library_dir"
 
-          printf -v current_repo \
-            "${LIBRARY_PREFIX}%03d" \
-            "$current_number"
+          # Build an MD5 index across all existing library repositories.
+          hash_index="/tmp/library-hashes.tsv"
+          : > "$hash_index"
 
-          echo ""
-          echo "Current library:"
-          echo "$current_repo"
+          for n in $(seq 1 "$highest"); do
+            repo="$(printf '%s-%03d' "$repo_prefix" "$n")"
+            repo_url="https://github.com/$owner/$repo.git"
+            clone_dir="$library_dir/$repo"
 
-          ensure_repo() {
-            local repo="$1"
-
-            if api_get \
-              "${API}/repos/${LIBRARY_OWNER}/${repo}" \
-              >/dev/null 2>&1
-            then
-              echo "Repository exists: $repo"
-              return
+            if ! git clone --quiet "$repo_url" "$clone_dir" 2>/dev/null; then
+              echo "Could not clone $repo; continuing."
+              continue
             fi
 
-            echo ""
-            echo "Creating private repository: $repo"
-
-            body=$(jq -n \
-              --arg name "$repo" \
-              '{
-                name: $name,
-                private: true,
-                description: "Music library",
-                has_issues: false,
-                has_projects: false,
-                has_wiki: false,
-                has_discussions: false,
-                has_downloads: true,
-                auto_init: false
-              }')
-
-            api_post \
-              "${API}/user/repos" \
-              "$body" >/dev/null
-
-            echo "Created: $repo"
-          }
-
-          clone_library() {
-            local repo="$1"
-
-            ensure_repo "$repo"
-
-            rm -rf /tmp/library
-
-            echo ""
-            echo "Cloning $repo..."
-
-            git clone \
-              "https://x-access-token:${GIT_PAT}@github.com/${LIBRARY_OWNER}/${repo}.git" \
-              /tmp/library
-
-            cd /tmp/library
-
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          }
-
-          get_library_size() {
-            cd /tmp/library
-
-            git ls-files -z |
-              while IFS= read -r -d '' file; do
-                if [ -f "$file" ]; then
-                  stat -c "%s" "$file"
-                fi
-              done |
-              awk '
-                {
-                  total += $1
-                }
-                END {
-                  print total + 0
-                }
-              '
-          }
-
-          build_hash_index() {
-            local repo="$1"
-
-            echo ""
-            echo "Building MD5 index for:"
-            echo "$repo"
-
-            rm -rf "/tmp/library-scan/$repo"
-
-            git clone \
-              --quiet \
-              "https://x-access-token:${GIT_PAT}@github.com/${LIBRARY_OWNER}/${repo}.git" \
-              "/tmp/library-scan/$repo"
-
-            find "/tmp/library-scan/$repo" \
-              -type f \
-              -iname "*.mp3" \
-              -print0 |
             while IFS= read -r -d '' file; do
-              md5sum "$file" | awk '{print $1}'
-            done
-          }
-
-          echo ""
-          echo "========================================"
-          echo "BUILDING LIBRARY HASH INDEX"
-          echo "========================================"
-
-          : > /tmp/library-hashes.txt
-
-          page=1
-
-          while true; do
-            repos=$(api_get \
-              "${API}/user/repos?visibility=all&affiliation=owner&per_page=100&page=${page}")
-
-            count=$(printf "%s" "$repos" | jq "length")
-
-            if [ "$count" -eq 0 ]; then
-              break
-            fi
-
-            while IFS= read -r repo_name; do
-              if [[ "$repo_name" =~ ^${LIBRARY_PREFIX}[0-9]+$ ]]; then
-                build_hash_index "$repo_name" \
-                  >> /tmp/library-hashes.txt
-              fi
-            done < <(printf "%s" "$repos" | jq -r ".[].name")
-
-            page=$((page + 1))
+              hash="$(md5sum "$file" | awk '{print $1}')"
+              printf '%s\t%s\t%s\n' "$hash" "$repo" "${file#$clone_dir/}" >> "$hash_index"
+            done < <(find "$clone_dir" -type f -iname '*.mp3' -print0)
           done
 
-          sort -u /tmp/library-hashes.txt \
-            -o /tmp/library-hashes.txt
+          current_repo="$highest"
+          current_name="$(printf '%s-%03d' "$repo_prefix" "$current_repo")"
+          current_dir="$library_dir/$current_name"
 
-          echo ""
-          echo "Existing unique MP3 hashes:"
-          wc -l /tmp/library-hashes.txt
+          if [[ ! -d "$current_dir/.git" ]]; then
+            current_dir="$library_dir/$(printf '%s-%03d' "$repo_prefix" 1)"
+          fi
 
-          hash_exists() {
-            local hash="$1"
-            grep -Fqx "$hash" /tmp/library-hashes.txt
-          }
+          : > "/tmp/source-${source_id}-archived.txt"
 
-          push_library() {
-            local size="$1"
+          while IFS=$'\t' read -r spotify_url file artist album album_artist title track_number disc_number release_date genre explicit duration_ms cover_url isrc record_source_id; do
+            [[ "$record_source_id" == "$source_id" ]] || continue
+            [[ -f "$file" ]] || continue
 
-            cd /tmp/library
+            hash="$(md5sum "$file" | awk '{print $1}')"
 
-            echo ""
-            echo "Pushing $current_repo"
-            echo "Library size: $size bytes"
+            if grep -Fq "${hash}"$'\t' "$hash_index"; then
+              echo "Exact duplicate already exists in library:"
+              grep -F "${hash}"$'\t' "$hash_index" | head -n1
 
-            printf "%s\n" "$size" > .library-size-bytes
-
-            git add .
-
-            if ! git diff --cached --quiet; then
-              git commit -m "Add downloaded music"
-              git push origin main
-            else
-              echo "No library changes to commit."
-            fi
-
-            echo "Push complete."
-          }
-
-          clone_library "$current_repo"
-
-          current_size=$(get_library_size)
-
-          echo ""
-          echo "Existing current library size:"
-          echo "$current_size bytes"
-
-          library_failed=0
-
-          while IFS=$'\t' read -r track audio_file || [ -n "$track" ]; do
-            if [ -z "$track" ] || [ -z "$audio_file" ]; then
+              printf '%s\n' "$spotify_url" >> "/tmp/source-${source_id}-archived.txt"
               continue
             fi
 
-            if [ ! -f "$audio_file" ]; then
-              echo "Downloaded file disappeared:"
-              echo "$audio_file"
-              library_failed=1
-              continue
-            fi
+            safe_artist="$(printf '%s' "$artist" | tr '/:' '__')"
+            safe_album="$(printf '%s' "$album" | tr '/:' '__')"
+            safe_title="$(printf '%s' "$title" | tr '/:' '__')"
 
-            file_size=$(stat -c "%s" "$audio_file")
-            file_hash=$(md5sum "$audio_file" | awk '{print $1}')
+            destination_dir="$current_dir/$safe_artist/$safe_album"
+            mkdir -p "$destination_dir"
 
-            echo ""
-            echo "----------------------------------------"
-            echo "Track:"
-            echo "$track"
-            echo "File:"
-            echo "$audio_file"
-            echo "Size:"
-            echo "$file_size bytes"
-            echo "MD5:"
-            echo "$file_hash"
-            echo "----------------------------------------"
+            destination="$destination_dir/$(printf '%02d - %s.mp3' "$track_number" "$safe_title")"
 
-            if hash_exists "$file_hash"; then
-              echo ""
-              echo "DUPLICATE"
-              echo "An identical MP3 already exists somewhere"
-              echo "in the music-library repositories."
-              echo "Skipping file:"
-              echo "$audio_file"
+            # Calculate current tracked size and projected size.
+            current_size="$(git -C "$current_dir" ls-files -z \
+              | xargs -0 -r -I{} stat -c '%s' "$current_dir/{}" \
+              | awk '{sum += $1} END {print sum+0}')"
 
-              rm -f "$audio_file"
+            file_size="$(stat -c '%s' "$file")"
 
-              printf "%s\n" "$track" >> /tmp/library-added-tracks.txt
-              continue
-            fi
+            if (( current_size + file_size > LIBRARY_LIMIT_BYTES )); then
+              echo "Rolling over from $current_name."
 
-            if [ "$file_size" -gt "$LIBRARY_LIMIT_BYTES" ]; then
-              echo ""
-              echo "File is larger than the entire 900 MiB library limit."
-              echo "Cannot store:"
-              echo "$audio_file"
-              library_failed=1
-              continue
-            fi
-
-            projected_size=$((current_size + file_size))
-
-            if [ "$current_size" -gt 0 ] && [ "$projected_size" -gt "$LIBRARY_LIMIT_BYTES" ]; then
-              echo ""
-              echo "900 MiB threshold reached."
-              echo "Rolling over."
-
-              push_library "$current_size"
-
-              current_number=$((current_number + 1))
-
-              printf -v current_repo \
-                "${LIBRARY_PREFIX}%03d" \
-                "$current_number"
-
-              clone_library "$current_repo"
-
-              current_size=$(get_library_size)
-
-              echo ""
-              echo "New library:"
-              echo "$current_repo"
-
-              projected_size=$((current_size + file_size))
-            fi
-
-            relative_path="${audio_file#/tmp/music-downloads/}"
-            destination="/tmp/library/$relative_path"
-
-            mkdir -p "$(dirname "$destination")"
-
-            if [ -f "$destination" ]; then
-              existing_size=$(stat -c "%s" "$destination")
-
-              if [ "$existing_size" -eq "$file_size" ]; then
-                existing_hash=$(md5sum "$destination" | awk '{print $1}')
-
-                if [ "$existing_hash" = "$file_hash" ]; then
-                  echo "Identical file already exists at:"
-                  echo "$relative_path"
-
-                  rm -f "$audio_file"
-
-                  printf "%s\n" "$track" >> /tmp/library-added-tracks.txt
-                  continue
-                fi
+              git -C "$current_dir" add -A
+              if ! git -C "$current_dir" diff --cached --quiet; then
+                git -C "$current_dir" \
+                  -c user.name="github-actions[bot]" \
+                  -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                  commit -m "Add music from source #$source_id"
+                git -C "$current_dir" push origin main
               fi
 
-              base="${destination%.mp3}"
-              destination="${base} [${current_number}].mp3"
+              current_repo=$((current_repo + 1))
+              current_name="$(printf '%s-%03d' "$repo_prefix" "$current_repo")"
+              current_dir="$library_dir/$current_name"
+
+              if [[ ! -d "$current_dir/.git" ]]; then
+                new_repo_payload="$(jq -n \
+                  --arg name "$current_name" \
+                  '{name:$name,private:true,auto_init:true}')"
+
+                curl -fsSL -X POST "${auth_headers[@]}" \
+                  -H "Content-Type: application/json" \
+                  "$api/user/repos" \
+                  -d "$new_repo_payload" >/dev/null
+
+                git clone --quiet \
+                  "https://github.com/$owner/$current_name.git" \
+                  "$current_dir"
+              fi
+
+              destination_dir="$current_dir/$safe_artist/$safe_album"
+              mkdir -p "$destination_dir"
+              destination="$destination_dir/$(printf '%02d - %s.mp3' "$track_number" "$safe_title")"
             fi
 
-            cp -p "$audio_file" "$destination"
+            cp "$file" "$destination"
 
-            printf "%s\n" "$file_hash" >> /tmp/library-hashes.txt
-            sort -u /tmp/library-hashes.txt -o /tmp/library-hashes.txt
+            printf '%s\t%s\t%s\n' "$hash" "$current_name" "${destination#$current_dir/}" >> "$hash_index"
+            printf '%s\n' "$spotify_url" >> "/tmp/source-${source_id}-archived.txt"
 
-            current_size=$((current_size + file_size))
+          done < "$source_staged"
 
-            printf "%s\n" "$track" >> /tmp/library-added-tracks.txt
+          # Commit and push the source checkpoint.
+          if git -C "$current_dir" status --short | grep -q .; then
+            git -C "$current_dir" add -A
+            git -C "$current_dir" \
+              -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "Add music from source #$source_id"
 
-            echo ""
-            echo "Added:"
-            echo "${destination#/tmp/library/}"
-
-          done < /tmp/verified-downloads.txt
-
-          push_library "$current_size"
-
-          if [ "$library_failed" -eq 1 ]; then
-            echo "1" > /tmp/had-library-failures
-          else
-            echo "0" > /tmp/had-library-failures
+            git -C "$current_dir" push origin main
           fi
 
-          echo ""
-          echo "========================================"
-          echo "LIBRARY COMPLETE"
-          echo "========================================"
+          echo "Library checkpoint completed for source #$source_id"
+          HELPER
 
-          echo "Final repository:"
-          echo "$current_repo"
+          chmod +x scripts/push-source-to-library.sh
 
-          echo "Final size:"
-          echo "$current_size bytes"
-
-      - name: Finalize successful archive
-        if: always()
-        run: |
-          set -u
-
-          if [ ! -s /tmp/verified-downloads.txt ]; then
-            echo "No verified downloads to archive."
-            exit 0
-          fi
-
-          if [ -f /tmp/had-library-failures ] &&
-             [ "$(cat /tmp/had-library-failures)" = "1" ]; then
-            echo "Library processing had failures."
-            echo "Verified tracks will NOT be added to archive.txt."
-            exit 0
-          fi
-
-          while IFS=$'\t' read -r track audio_file || [ -n "$track" ]; do
-            if [ -n "$track" ]; then
-              printf "%s\n" "$track" >> archive.txt
-            fi
-          done < /tmp/verified-downloads.txt
-
-          sort -u archive.txt -o archive.txt
-
-          echo "Archived verified tracks:"
-          wc -l /tmp/verified-downloads.txt
-
-      - name: Update downloader state
-        if: always()
+      - name: Update downloader state safely
         env:
-          GIT_PAT: "${{ secrets.GIT_PAT }}"
+          GIT_PAT: ${{ secrets.GIT_PAT }}
         run: |
           set -euo pipefail
+
+          # State files are generated locally, then merged onto the newest
+          # origin/main instead of using git pull --rebase. This avoids the
+          # failed.txt rebase conflict seen when concurrent runs finish close
+          # together.
+          new_failures="/tmp/current-run-failures.txt"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          sort -u archive.txt -o archive.txt
-
-          git add archive.txt failed.txt
-
-          if git diff --cached --quiet; then
-            echo "No state changes."
-            exit 0
+          if [[ -f "$new_failures" && -s "$new_failures" ]]; then
+            cp "$new_failures" /tmp/new-failures.txt
+          else
+            : > /tmp/new-failures.txt
           fi
 
-          git commit -m "Update download state"
+          # archive.txt is already updated by successful source checkpoints.
+          # Preserve it while refreshing the branch.
+          cp archive.txt /tmp/local-archive.txt 2>/dev/null || : > /tmp/local-archive.txt
 
-          git remote set-url origin \
-            "https://x-access-token:${GIT_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3 4 5; do
+            echo "State update attempt $attempt"
 
-          git pull --rebase origin main
-          git push origin main
+            git fetch origin main
+            git reset --hard origin/main
 
-      - name: Report failures
+            touch failed.txt archive.txt
+
+            if [[ -s /tmp/new-failures.txt ]]; then
+              cat /tmp/new-failures.txt >> failed.txt
+              sort -u failed.txt -o failed.txt
+            fi
+
+            if [[ -s /tmp/local-archive.txt ]]; then
+              cat /tmp/local-archive.txt >> archive.txt
+              sort -u archive.txt -o archive.txt
+            fi
+
+            git add failed.txt archive.txt
+
+            if git diff --cached --quiet; then
+              echo "No downloader state changes to commit."
+              break
+            fi
+
+            git commit -m "Update download state"
+
+            if git push origin HEAD:main; then
+              echo "Downloader state pushed successfully."
+              break
+            fi
+
+            echo "Push raced another run; retrying."
+            git reset --hard HEAD^
+            sleep "$attempt"
+          done
+
+      - name: Write run summary
         if: always()
         run: |
-          echo ""
-          echo "========================================"
-          echo "FINAL REPORT"
-          echo "========================================"
-
-          if [ -f /tmp/had-download-failures ] &&
-             [ "$(cat /tmp/had-download-failures)" = "1" ]; then
-            echo ""
-            echo "Some tracks failed with all providers."
-            echo "They were NOT added to archive.txt."
-            echo "They will be retried on the next run."
-          fi
-
-          if [ -f /tmp/had-library-failures ] &&
-             [ "$(cat /tmp/had-library-failures)" = "1" ]; then
-            echo ""
-            echo "Some verified downloads could not be added to the library."
-            echo "Those tracks were NOT added to archive.txt."
-          fi
-
-          if [ -s /tmp/resolution-failures.txt ]; then
-            echo ""
-            echo "Some Spotify URLs could not be resolved:"
-            cat /tmp/resolution-failures.txt
-          fi
-
-          exit 0
+          {
+            echo "# Spotify downloader run"
+            echo
+            echo "- Finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- Verified downloads: $(wc -l < "$VERIFIED_FILE" 2>/dev/null || echo 0)"
+            echo "- Provider failures/quarantine events: $(wc -l < "$FAILURES_FILE" 2>/dev/null || echo 0)"
+            echo
+            echo "## Failures"
+            if [[ -s "$FAILURES_FILE" ]]; then
+              echo '```text'
+              cat "$FAILURES_FILE"
+              echo '```'
+            else
+              echo "None recorded."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
