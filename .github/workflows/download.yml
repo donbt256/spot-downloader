@@ -926,19 +926,20 @@ jobs:
                 2> "${soundcloud_dir}/search.log" || true
 
               if [ -s "$raw_jsonl" ]; then
-                jq -s -c '
-                  [
-                    .[]
-                    | if ((.entries? // null) | type) == "array"
-                      then .entries[]
-                      else .
-                      end
-                  ][]
-                ' "$raw_jsonl" |
-                jq -c \
+                if ! jq -s -c \
                   --arg wanted_title "$title" \
                   --arg wanted_artist "$artist" \
                   --argjson expected_ms "${duration_ms:-0}" '
+                  def search_entries:
+                    if type == "object" and (.entries? | type) == "array"
+                    then .entries[] | search_entries
+                    else .
+                    end;
+
+                  def soundcloud_permalink:
+                    type == "string"
+                    and test("^https://(www\\.)?soundcloud\\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+([/?#].*)?$");
+
                   def norm:
                     ascii_downcase
                     | gsub("[^a-z0-9]+"; " ")
@@ -950,51 +951,54 @@ jobs:
                       "i"
                     );
 
-                  . as $item
-                  | (($item.webpage_url // $item.original_url // "") | tostring) as $url
-                  | (($item.title // "") | tostring) as $candidate_title
-                  | (($item.uploader // $item.channel // "") | tostring) as $uploader
-                  | select(
-                      $url
-                      | test("^https://(www\\.)?soundcloud\\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+([/?#].*)?$")
-                    )
-                  | select((($candidate_title + " " + $url) | bad_variant) | not)
-                  | ($candidate_title | norm) as $ct
-                  | ($wanted_title | norm) as $wt
-                  | ($uploader | norm) as $up
-                  | ($wanted_artist | norm) as $wa
-                  | (
-                      (if $ct == $wt then 100 else 0 end)
-                      + (if ($ct | contains($wt)) then 35 else 0 end)
-                      + (if ($ct | contains($wa)) then 20 else 0 end)
-                      + (if ($up | contains($wa)) then 30 else 0 end)
-                      + (
-                          if (($item.duration // 0) > 0 and $expected_ms > 0)
-                          then
-                            (
-                              (($item.duration * 1000) - $expected_ms)
-                              | if . < 0 then - . else . end
-                            )
-                            | if . <= 15000 then 25
-                              elif . <= ($expected_ms * 0.08) then 15
-                              else 0
-                              end
-                          else 0
-                          end
-                        )
-                    ) as $score
-                  | {
-                      url: $url,
-                      title: $candidate_title,
-                      uploader: $uploader,
-                      duration: ($item.duration // 0),
-                      score: $score
-                    }
-                ' |
-                jq -s -c '
-                  sort_by(-.score, .title, .url)
+                  [
+                    .[]
+                    | search_entries
+                    | . as $item
+                    | ($item.webpage_url // $item.original_url // null) as $url
+                    | (($item.title // "") | tostring) as $candidate_title
+                    | (($item.uploader // $item.channel // "") | tostring) as $uploader
+                    | select($url | soundcloud_permalink)
+                    | select((($candidate_title + " " + $url) | bad_variant) | not)
+                    | ($candidate_title | norm) as $ct
+                    | ($wanted_title | norm) as $wt
+                    | ($uploader | norm) as $up
+                    | ($wanted_artist | norm) as $wa
+                    | (
+                        (if $ct == $wt then 100 else 0 end)
+                        + (if ($ct | contains($wt)) then 35 else 0 end)
+                        + (if ($ct | contains($wa)) then 20 else 0 end)
+                        + (if ($up | contains($wa)) then 30 else 0 end)
+                        + (
+                            if (($item.duration // 0) > 0 and $expected_ms > 0)
+                            then
+                              (
+                                (($item.duration * 1000) - $expected_ms)
+                                | if . < 0 then - . else . end
+                              )
+                              | if . <= 15000 then 25
+                                elif . <= ($expected_ms * 0.08) then 15
+                                else 0
+                                end
+                            else 0
+                            end
+                          )
+                      ) as $score
+                    | {
+                        url: $url,
+                        title: $candidate_title,
+                        uploader: $uploader,
+                        duration: ($item.duration // 0),
+                        score: $score
+                      }
+                  ]
+                  | sort_by(-.score, .title, .url)
                   | .[]
-                ' > "$candidates_jsonl" || true
+                ' "$raw_jsonl" > "$candidates_jsonl"; then
+                  echo "Unable to parse structured SoundCloud search results." \
+                    | tee -a "${soundcloud_dir}/search.log" >&2
+                  : > "$candidates_jsonl"
+                fi
               fi
 
               if [ -s "$candidates_jsonl" ]; then
