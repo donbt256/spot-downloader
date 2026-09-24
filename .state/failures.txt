@@ -1,7 +1,14 @@
+source=1	track=1	artist=Mother Mother	title=O My Heart	url=https://open.spotify.com/track/15geVctY3jvUuDkEAaQPdV
 source=1	track=1	artist=Mother Mother	title=Try To Change	url=https://open.spotify.com/track/0Ku088EwcUjIuDoAl77kzO
+source=1	track=10	artist=Mother Mother	title=Arms Tonite	url=https://open.spotify.com/track/5plW0IS6XNNFFvLCH15edI
+source=1	track=11	artist=Mother Mother	title=Miles	url=https://open.spotify.com/track/35FVFBKP8QvJWURmkx3jrP
 source=1	track=11	artist=Mother Mother	title=Sleep Awake	url=https://open.spotify.com/track/36RPuGznqDprSxcjSuguZ8
+source=1	track=12	artist=Mother Mother	title=Sleep Awake	url=https://open.spotify.com/track/36RPuGznqDprSxcjSuguZ8
+source=1	track=3	artist=Mother Mother	title=Body Of Years	url=https://open.spotify.com/track/6q5wsa7S7wyyFyvTXECtTg
 source=1	track=3	artist=Mother Mother	title=O My Heart	url=https://open.spotify.com/track/15geVctY3jvUuDkEAaQPdV
 source=1	track=4	artist=Mother Mother	title=Body Of Years	url=https://open.spotify.com/track/6q5wsa7S7wyyFyvTXECtTg
+source=1	track=4	artist=Mother Mother	title=Try To Change	url=https://open.spotify.com/track/0Ku088EwcUjIuDoAl77kzO
 source=1	track=8	artist=Mother Mother	title=Wrecking Ball	url=https://open.spotify.com/track/007JQyyu6DrGza9XX6scAN
 source=1	track=9	artist=Mother Mother	title=Arms Tonite	url=https://open.spotify.com/track/5plW0IS6XNNFFvLCH15edI
+source=1	track=9	artist=Mother Mother	title=Wrecking Ball	url=https://open.spotify.com/track/007JQyyu6DrGza9XX6scAN
 source=1 reason=library-checkpoint-failed
