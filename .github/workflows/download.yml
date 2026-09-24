@@ -125,13 +125,22 @@ jobs:
           mkdir -p "$WORK_ROOT"
           : > "$HASH_FILE"
 
-          # Use a temporary credential store so every git clone/push can authenticate
-          # without prompting on stdin.
-          CRED_FILE="$WORK_ROOT/git-credentials"
-          printf 'https://x-access-token:%s@github.com\n' "$GIT_PAT" > "$CRED_FILE"
-          chmod 600 "$CRED_FILE"
+          # Authenticate Git non-interactively without placing the PAT in a remote URL.
+          ASKPASS="$WORK_ROOT/git-askpass.sh"
 
-          git config --global credential.helper "store --file=$CRED_FILE"
+          cat > "$ASKPASS" <<'ASKPASS_EOF'
+          #!/usr/bin/env bash
+          case "$1" in
+            *Username*) printf '%s\n' "x-access-token" ;;
+            *Password*) printf '%s\n' "$GIT_PAT" ;;
+            *) printf '%s\n' "" ;;
+          esac
+          ASKPASS_EOF
+
+          chmod 700 "$ASKPASS"
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+          export GIT_PAT
 
           api_get() {
             curl -fsSL \
@@ -351,7 +360,7 @@ jobs:
 
           chmod +x scripts/push-source-to-library.sh
 
-      - name: Resolve Spotify sources
+      - name: Resolve Spotify metadata with Web API
         shell: bash
         env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
@@ -364,6 +373,85 @@ jobs:
             exit 1
           fi
 
+          token_response="$(
+            curl -fsSL \
+              -u "${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "grant_type=client_credentials" \
+              https://accounts.spotify.com/api/token \
+              < /dev/null
+          )"
+
+          spotify_token="$(jq -r '.access_token // empty' <<< "$token_response")"
+
+          if [ -z "$spotify_token" ]; then
+            echo "Failed to obtain Spotify API access token."
+            echo "$token_response" | jq . 2>/dev/null || true
+            exit 1
+          fi
+
+          spotify_get() {
+            local url="$1"
+            local attempt response status
+
+            for attempt in 1 2 3 4 5; do
+              response_file="/tmp/spotify-response-${RANDOM}.json"
+              status="$(
+                curl -sS \
+                  -o "$response_file" \
+                  -w '%{http_code}' \
+                  -H "Authorization: Bearer ${spotify_token}" \
+                  "$url" \
+                  < /dev/null
+              )"
+
+              if [ "$status" = "200" ]; then
+                cat "$response_file"
+                rm -f "$response_file"
+                return 0
+              fi
+
+              if [ "$status" = "429" ]; then
+                retry_after="$(
+                  curl -sSI \
+                    -H "Authorization: Bearer ${spotify_token}" \
+                    "$url" \
+                    < /dev/null |
+                    awk -F': ' 'tolower($1) == "retry-after" {gsub("\r","",$2); print $2; exit}'
+                )"
+                retry_after="${retry_after:-5}"
+                echo "Spotify API rate limited; waiting ${retry_after}s..." >&2
+                rm -f "$response_file"
+                sleep "$retry_after"
+                continue
+              fi
+
+              echo "Spotify API returned HTTP ${status} for ${url}" >&2
+              cat "$response_file" >&2 || true
+              rm -f "$response_file"
+              return 1
+            done
+
+            echo "Spotify API request failed after retries: ${url}" >&2
+            return 1
+          }
+
+          extract_spotify_url() {
+            local raw="$1"
+
+            if [[ "$raw" =~ ^https://open\.spotify\.com/(album|track|playlist)/([A-Za-z0-9]+)(\?.*)?$ ]]; then
+              printf '%s\n' "$raw" | sed 's/[?].*$//'
+              return 0
+            fi
+
+            if [[ "$raw" =~ ^spotify:(album|track|playlist):([A-Za-z0-9]+)$ ]]; then
+              printf 'https://open.spotify.com/%s/%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+              return 0
+            fi
+
+            return 1
+          }
+
           source_index=0
 
           while IFS= read -r raw || [ -n "$raw" ]; do
@@ -373,97 +461,186 @@ jobs:
             [ -n "$raw" ] || continue
             [[ "$raw" == \#* ]] && continue
 
+            spotify_url="$(extract_spotify_url "$raw" || true)"
+
+            if [ -z "$spotify_url" ]; then
+              echo "Unsupported Spotify URL: $raw"
+              echo "Skipping this line."
+              continue
+            fi
+
             source_index=$((source_index + 1))
-            source_file="/tmp/source-${source_index}.spotdl"
+
+            kind="$(sed -nE 's#^https://open\.spotify\.com/([^/]+)/.*#\1#p' <<< "$spotify_url")"
+            object_id="$(sed -nE 's#^https://open\.spotify\.com/[^/]+/([^?]+).*#\1#p' <<< "$spotify_url")"
 
             echo
             echo "=== Resolving Spotify source #${source_index} ==="
-            echo "$raw"
+            echo "$spotify_url"
 
-            rm -f "$source_file"
+            if [ "$kind" = "album" ]; then
+              album_json="$(spotify_get "https://api.spotify.com/v1/albums/${object_id}")"
 
-            spotdl save "$raw" \
-              --client-id "$SPOTIFY_CLIENT_ID" \
-              --client-secret "$SPOTIFY_CLIENT_SECRET" \
-              --save-file "$source_file" \
-              < /dev/null
+              album_name="$(jq -r '.name // "Unknown Album"' <<< "$album_json")"
+              album_artist="$(jq -r '(.artists[0].name // "Unknown Artist")' <<< "$album_json")"
+              release_date="$(jq -r '.release_date // ""' <<< "$album_json")"
+              total_tracks="$(jq -r '.total_tracks // 0' <<< "$album_json")"
+              cover_url="$(jq -r '.images[0].url // ""' <<< "$album_json")"
 
-            if [ ! -s "$source_file" ]; then
-              echo "Resolver produced no data for source #${source_index}."
-              exit 1
-            fi
+              offset=0
+              while [ "$offset" -lt "$total_tracks" ]; do
+                page="$(spotify_get "https://api.spotify.com/v1/albums/${object_id}/tracks?limit=50&offset=${offset}")"
 
-            if ! jq -e 'type == "array"' "$source_file" >/dev/null; then
-              echo "spotDL save output is not a JSON array:"
-              head -c 1000 "$source_file" || true
-              exit 1
-            fi
+                jq -c \
+                  --argjson source_id "$source_index" \
+                  --arg source_url "$spotify_url" \
+                  --arg album "$album_name" \
+                  --arg album_artist "$album_artist" \
+                  --arg release_date "$release_date" \
+                  --arg cover_url "$cover_url" \
+                  --argjson offset "$offset" '
+                  .items[]
+                  | select(.is_local != true)
+                  | {
+                      source_id: $source_id,
+                      source_url: $source_url,
+                      url: (.external_urls.spotify // ("https://open.spotify.com/track/" + .id)),
+                      spotify_id: (.id // ""),
+                      name: (.name // ""),
+                      artist: (.artists[0].name // "Unknown Artist"),
+                      artists: ([.artists[]?.name] | map(select(. != null))),
+                      album: $album,
+                      album_artist: $album_artist,
+                      track_number: (.track_number // 1),
+                      disc_number: (.disc_number // 1),
+                      duration_ms: (.duration_ms // 0),
+                      release_date: $release_date,
+                      year: (if ($release_date | length) >= 4 then $release_date[0:4] else "" end),
+                      genre: "",
+                      explicit: (.explicit // false),
+                      isrc: (.external_ids.isrc // ""),
+                      cover_url: $cover_url,
+                      list_name: "",
+                      list_url: "",
+                      list_position: (($offset + .track_number) // 0),
+                      list_length: 0
+                    }
+                ' <<< "$page" >> "$RESOLVED_FILE"
 
-            count=0
+                page_count="$(jq '.items | length' <<< "$page")"
+                offset=$((offset + page_count))
 
-            while IFS= read -r track_json; do
-              [ -n "$track_json" ] || continue
+                [ "$page_count" -gt 0 ] || break
+              done
 
-              count=$((count + 1))
+              source_count="$(jq -c --argjson id "$source_index" 'select(.source_id == $id)' "$RESOLVED_FILE" | wc -l)"
+
+              echo "Album: ${album_name}"
+              echo "Album artist: ${album_artist}"
+              echo "Tracks resolved: ${source_count}"
+
+            elif [ "$kind" = "track" ]; then
+              track_json="$(spotify_get "https://api.spotify.com/v1/tracks/${object_id}")"
 
               jq -c \
                 --argjson source_id "$source_index" \
-                --arg source_url "$raw" \
-                --argjson position "$count" '
-                {
-                  source_id: $source_id,
-                  source_url: $source_url,
-                  url: (.url // ""),
-                  name: (.name // ""),
-                  artist: (.artist // ""),
-                  artists: (.artists // []),
-                  album: (.album // ""),
-                  album_artist: (.album_artist // .artist // ""),
-                  track_number: (
-                    if ((.track_number // 1) | tonumber) >= 1
-                    then ((.track_number // 1) | tonumber)
-                    else 1
-                    end
-                  ),
-                  disc_number: (
-                    if ((.disc_number // 1) | tonumber) >= 1
-                    then ((.disc_number // 1) | tonumber)
-                    else 1
-                    end
-                  ),
-                  duration_ms: (.duration_ms // 0),
-                  release_date: (.release_date // ""),
-                  year: (.year // ""),
-                  genre: (.genre // ""),
-                  explicit: (.explicit // false),
-                  isrc: (.isrc // ""),
-                  cover_url: (.cover_url // ""),
-                  list_name: (.list_name // ""),
-                  list_url: (.list_url // ""),
-                  list_position: (.list_position // $position),
-                  list_length: (.list_length // 0)
-                }
+                --arg source_url "$spotify_url" '
+                select(.is_local != true)
+                | {
+                    source_id: $source_id,
+                    source_url: $source_url,
+                    url: (.external_urls.spotify // ("https://open.spotify.com/track/" + .id)),
+                    spotify_id: (.id // ""),
+                    name: (.name // ""),
+                    artist: (.artists[0].name // "Unknown Artist"),
+                    artists: ([.artists[]?.name] | map(select(. != null))),
+                    album: (.album.name // "Unknown Album"),
+                    album_artist: (.album.artists[0].name // .artists[0].name // "Unknown Artist"),
+                    track_number: (.track_number // 1),
+                    disc_number: (.disc_number // 1),
+                    duration_ms: (.duration_ms // 0),
+                    release_date: (.album.release_date // ""),
+                    year: (if ((.album.release_date // "") | length) >= 4 then .album.release_date[0:4] else "" end),
+                    genre: "",
+                    explicit: (.explicit // false),
+                    isrc: (.external_ids.isrc // ""),
+                    cover_url: (.album.images[0].url // ""),
+                    list_name: "",
+                    list_url: "",
+                    list_position: 1,
+                    list_length: 1
+                  }
               ' <<< "$track_json" >> "$RESOLVED_FILE"
 
-            done < <(jq -c '.[]' "$source_file")
+            elif [ "$kind" = "playlist" ]; then
+              playlist_json="$(spotify_get "https://api.spotify.com/v1/playlists/${object_id}")"
 
-            echo "Saved ${count} songs to ${source_file}"
+              playlist_name="$(jq -r '.name // "Spotify Playlist"' <<< "$playlist_json")"
 
-            if [ "$count" -eq 0 ]; then
-              echo "No tracks resolved for source #${source_index}."
-              exit 1
+              offset=0
+              total_items="$(jq -r '.items.total // 0' <<< "$playlist_json")"
+
+              while [ "$offset" -lt "$total_items" ]; do
+                page="$(spotify_get "https://api.spotify.com/v1/playlists/${object_id}/tracks?limit=50&offset=${offset}")"
+
+                jq -c \
+                  --argjson source_id "$source_index" \
+                  --arg source_url "$spotify_url" \
+                  --arg playlist_name "$playlist_name" \
+                  --argjson offset "$offset" '
+                  .items[]
+                  | select(.track != null)
+                  | select(.track.type == "track")
+                  | select(.track.is_local != true)
+                  | .track as $t
+                  | {
+                      source_id: $source_id,
+                      source_url: $source_url,
+                      url: ($t.external_urls.spotify // ("https://open.spotify.com/track/" + $t.id)),
+                      spotify_id: ($t.id // ""),
+                      name: ($t.name // ""),
+                      artist: ($t.artists[0].name // "Unknown Artist"),
+                      artists: ([$t.artists[]?.name] | map(select(. != null))),
+                      album: ($t.album.name // "Unknown Album"),
+                      album_artist: ($t.album.artists[0].name // $t.artists[0].name // "Unknown Artist"),
+                      track_number: ($t.track_number // 1),
+                      disc_number: ($t.disc_number // 1),
+                      duration_ms: ($t.duration_ms // 0),
+                      release_date: ($t.album.release_date // ""),
+                      year: (if (($t.album.release_date // "") | length) >= 4 then $t.album.release_date[0:4] else "" end),
+                      genre: "",
+                      explicit: ($t.explicit // false),
+                      isrc: ($t.external_ids.isrc // ""),
+                      cover_url: ($t.album.images[0].url // ""),
+                      list_name: $playlist_name,
+                      list_url: $source_url,
+                      list_position: ($offset + 1),
+                      list_length: 0
+                    }
+                ' <<< "$page" |
+                jq -c '.' >> "$RESOLVED_FILE"
+
+                page_count="$(jq '.items | length' <<< "$page")"
+                offset=$((offset + page_count))
+
+                [ "$page_count" -gt 0 ] || break
+              done
+
+            else
+              echo "Unsupported Spotify object type: ${kind}"
+              continue
             fi
           done < urls.txt
 
           total="$(wc -l < "$RESOLVED_FILE")"
 
           echo
-          echo "=== Resolver summary ==="
+          echo "=== Spotify API resolver summary ==="
           echo "Sources: ${source_index}"
           echo "Tracks:  ${total}"
 
           if [ "$total" -eq 0 ]; then
-            echo "No Spotify sources were found in urls.txt."
+            echo "No Spotify tracks were resolved."
             exit 0
           fi
 
@@ -503,9 +680,11 @@ jobs:
             source_verified="/tmp/source-${source_id}-verified.tsv"
             source_archived="/tmp/source-${source_id}-archived.txt"
 
-            jq -c \
+            jq -s -c \
               --argjson id "$source_id" \
-              'select(.source_id == $id)' \
+              'map(select(.source_id == $id))
+               | sort_by(.disc_number, .track_number, .list_position)
+               | .[]' \
               "$RESOLVED_FILE" > "$source_records"
 
             : > "$source_verified"
@@ -536,8 +715,16 @@ jobs:
               spotify_url="$(jq -r '.url' "$track_record")"
               title="$(jq -r '.name // "Unknown Title"' "$track_record")"
               artist="$(jq -r '.artist // "Unknown Artist"' "$track_record")"
-              album="$(jq -r '.album // "Unknown Album"' "$track_record")"
-              album_artist="$(jq -r '.album_artist // .artist // "Unknown Artist"' "$track_record")"
+              album="$(jq -r '.album // empty' "$track_record")"
+              album_artist="$(jq -r '.album_artist // .artist // empty' "$track_record")"
+
+              if [ -z "$album" ] || [ "$album" = "null" ]; then
+                album="Unknown Album"
+              fi
+
+              if [ -z "$album_artist" ] || [ "$album_artist" = "null" ]; then
+                album_artist="$artist"
+              fi
               track_number="$(jq -r '.track_number // 1' "$track_record")"
               disc_number="$(jq -r '.disc_number // 1' "$track_record")"
               duration_ms="$(jq -r '.duration_ms // 0' "$track_record")"
@@ -836,6 +1023,12 @@ jobs:
           sort -u .state/failures.txt -o .state/failures.txt
           sort -u .state/archive.txt -o .state/archive.txt
 
+          current_failures="/tmp/state-failures.txt"
+          current_archive="/tmp/state-archive.txt"
+
+          cp .state/failures.txt "$current_failures"
+          cp .state/archive.txt "$current_archive"
+
           for attempt in 1 2 3 4 5; do
             echo "State update attempt ${attempt}/5"
 
@@ -843,16 +1036,11 @@ jobs:
             git reset --hard origin/main
 
             mkdir -p .state
-
-            if [ -f "$FAILURES_FILE" ]; then
-              cat "$FAILURES_FILE" >> .state/failures.txt
-            fi
-
-            if [ -f archive.txt ]; then
-              cat archive.txt >> .state/archive.txt
-            fi
-
             touch .state/failures.txt .state/archive.txt
+
+            cat "$current_failures" >> .state/failures.txt
+            cat "$current_archive" >> .state/archive.txt
+
             sort -u .state/failures.txt -o .state/failures.txt
             sort -u .state/archive.txt -o .state/archive.txt
 
