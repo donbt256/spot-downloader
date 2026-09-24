@@ -1,2 +1,9 @@
 
+2026-09-24T15:27:53Z | source=1 | class=resolver-data-corruption | reason=invalid JSON record
+2026-09-24T15:28:12Z | source=https://open.spotify.com/track/0Ku088EwcUjIuDoAl77kzO | track=Try To Change | provider=soundcloud | class=identity-mismatch | expected=241.000s | actual=258.951837s
+2026-09-24T15:28:18Z | source=https://open.spotify.com/track/0Ku088EwcUjIuDoAl77kzO | track=Try To Change | provider=bandcamp | class=unknown | reason=provider failure
+2026-09-24T15:28:29Z | source=1 | class=resolver-data-corruption | reason=invalid JSON record
+2026-09-24T15:28:55Z | source=1 | class=resolver-data-corruption | reason=invalid JSON record
+2026-09-24T15:29:14Z | source=https://open.spotify.com/track/5plW0IS6XNNFFvLCH15edI | track=Arms Tonite | provider=soundcloud | class=identity-mismatch | expected=216.000s | actual=208.117551s
+2026-09-24T15:29:35Z | source=1 | class=resolver-data-corruption | reason=invalid JSON record
 Could not resolve: https://open.spotify.com/album/41U6Qbx5KxhHYIuwlK3lXA
