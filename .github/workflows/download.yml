@@ -1,0 +1,58 @@
+name: Download Music
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out downloader
+        uses: actions/checkout@v4
+
+      - name: Check GitHub PAT
+        env:
+          GIT_PAT: ${{ secrets.GIT_PAT }}
+        run: |
+          set -e
+
+          response=$(curl -fsS \
+            -H "Authorization: Bearer $GIT_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            https://api.github.com/user)
+
+          echo "$response" | python -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          print("Authenticated as:", data["login"])
+          '
+
+      - name: Check library repository
+        env:
+          GIT_PAT: ${{ secrets.GIT_PAT }}
+        run: |
+          set -e
+
+          curl -fsS \
+            -H "Authorization: Bearer $GIT_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            https://api.github.com/repos/donbt256/music-library-001 \
+            > /tmp/library.json
+
+          python - <<'PY'
+          import json
+
+          with open("/tmp/library.json") as f:
+              repo = json.load(f)
+
+          print("Library repository:", repo["full_name"])
+          print("Private:", repo["private"])
+          print("Default branch:", repo["default_branch"])
+          print("Size:", repo["size"], "KB")
+          PY
