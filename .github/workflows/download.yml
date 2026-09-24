@@ -59,7 +59,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           spotdl --download-deno
+
+          # spotDL installs Deno under ~/.config/spotdl but does not necessarily
+          # put that directory on PATH in GitHub Actions.
+          DENO_DIR="$HOME/.config/spotdl"
+
+          if [ ! -x "$DENO_DIR/deno" ]; then
+            echo "Deno was not installed where spotDL reported: $DENO_DIR/deno"
+            ls -la "$DENO_DIR" || true
+            exit 1
+          fi
+
+          echo "$DENO_DIR" >> "$GITHUB_PATH"
+          export PATH="$DENO_DIR:$PATH"
+
+          "$DENO_DIR/deno" --version
           deno --version
 
       - name: Prepare workspace
