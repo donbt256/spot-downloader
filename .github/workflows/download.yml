@@ -26,7 +26,7 @@ jobs:
       QUARANTINE_DIR: /tmp/music-quarantine
       VERIFIED_FILE: /tmp/verified-downloads.txt
       FAILURES_FILE: /tmp/current-run-failures.txt
-      RESOLVED_FILE: /tmp/resolved-tracks.tsv
+      RESOLVED_FILE: /tmp/resolved-tracks.jsonl
 
     steps:
       - name: Check out downloader
@@ -303,14 +303,14 @@ jobs:
                   --arg source_url "$raw" \
                   '
                   {
-                    source_id: $source_id,
+                    source_id: ($source_id | tonumber),
                     source_url: $source_url,
                     url: (.url // ""),
                     name: (.name // ""),
                     artist: (.artist // ""),
                     artists: (
                       if (.artists | type) == "array"
-                      then (.artists | join(", "))
+                      then (.artists | map(tostring) | join(", "))
                       else (.artist // "")
                       end
                     ),
@@ -328,7 +328,7 @@ jobs:
                     year: (.year // ""),
                     genre: (
                       if (.genres | type) == "array"
-                      then (.genres | join(", "))
+                      then (.genres | map(tostring) | join(", "))
                       else (.genre // "")
                       end
                     ),
@@ -340,11 +340,7 @@ jobs:
                     list_position: (.list_position // null),
                     list_length: (.list_length // null)
                   }
-                  ' <<< "$song" |
-                  {
-                    IFS= read -r record
-                    printf '%s\t%s\n' "$source_index" "$record"
-                  } >> "$RESOLVED_FILE"
+                  ' <<< "$song" >> "$RESOLVED_FILE"
               done
 
           done < urls.txt
@@ -352,6 +348,8 @@ jobs:
           echo
           echo "Resolved source/track records:"
           wc -l "$RESOLVED_FILE"
+          echo "Resolved source IDs:"
+          jq -r '.source_id' "$RESOLVED_FILE" | sort -n | uniq -c || true
 
           if [[ ! -s "$RESOLVED_FILE" ]]; then
             echo "ERROR: No Spotify tracks were resolved."
@@ -368,7 +366,7 @@ jobs:
           set -euo pipefail
 
           mapfile -t SOURCE_IDS < <(
-            cut -f1 "$RESOLVED_FILE" | awk '!seen[$0]++'
+            jq -r '.source_id' "$RESOLVED_FILE" | awk '!seen[$0]++'
           )
 
           for source_id in "${SOURCE_IDS[@]}"; do
@@ -377,7 +375,7 @@ jobs:
             echo "Processing Spotify source #$source_id"
             echo "############################################################"
 
-            source_records="/tmp/source-${source_id}-records.tsv"
+            source_records="/tmp/source-${source_id}-records.jsonl"
             source_failures="/tmp/source-${source_id}-failures.txt"
             source_verified="/tmp/source-${source_id}-verified.tsv"
 
@@ -385,7 +383,8 @@ jobs:
             : > "$source_failures"
             : > "$source_verified"
 
-            awk -F '\t' -v id="$source_id" '$1 == id {print $2}' \
+            jq -c --argjson id "$source_id" \
+              'select(.source_id == $id)' \
               "$RESOLVED_FILE" > "$source_records"
 
             track_index=0
@@ -394,6 +393,12 @@ jobs:
               [[ -z "$record" ]] && continue
               track_index=$((track_index + 1))
 
+              if ! jq -e . >/dev/null 2>&1 <<< "$record"; then
+                echo "Invalid resolved JSON for source #$source_id track #$track_index"
+                printf '%s | source=%s | class=resolver-data-corruption | reason=invalid JSON record\n'                   "$(date -u +%Y-%m-%dT%H:%M:%SZ)"                   "$source_id" >> "$source_failures"
+                continue
+              fi
+
               spotify_url="$(jq -r '.url' <<< "$record")"
               title="$(jq -r '.name' <<< "$record")"
               artist="$(jq -r '.artist' <<< "$record")"
@@ -401,6 +406,14 @@ jobs:
               album_artist="$(jq -r '.album_artist' <<< "$record")"
               track_number="$(jq -r '.track_number // 1' <<< "$record")"
               disc_number="$(jq -r '.disc_number // 1' <<< "$record")"
+
+              if ! [[ "$track_number" =~ ^[0-9]+$ ]] || (( track_number < 1 )); then
+                track_number=1
+              fi
+              if ! [[ "$disc_number" =~ ^[0-9]+$ ]] || (( disc_number < 1 )); then
+                disc_number=1
+              fi
+
               duration_ms="$(jq -r '.duration_ms // 0' <<< "$record")"
               release_date="$(jq -r '.release_date // ""' <<< "$record")"
               year="$(jq -r '.year // ""' <<< "$record")"
