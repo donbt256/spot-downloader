@@ -11,7 +11,7 @@ permissions:
 env:
   LIBRARY_OWNER: "donbt256"
   LIBRARY_PREFIX: "music-library-"
-  LIBRARY_LIMIT_BYTES: "4831838208"
+  LIBRARY_LIMIT_BYTES: "943718400"
   AUDIO_FORMAT: "mp3"
   AUDIO_BITRATE: "128k"
 
@@ -34,8 +34,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg git-lfs jq
-          git lfs install
+          sudo apt-get install -y ffmpeg jq
 
       - name: Install spotDL
         run: |
@@ -86,11 +85,14 @@ jobs:
               --client-secret "$SPOTIFY_CLIENT_SECRET" \
               --save-file /tmp/current.spotdl
             then
-              python -c 'import json; songs=json.load(open("/tmp/current.spotdl", encoding="utf-8")); [print(s["url"]) for s in songs if s.get("url") and "open.spotify.com/track/" in s["url"]]' >> /tmp/track-urls.txt
+              python -c 'import json; songs=json.load(open("/tmp/current.spotdl", encoding="utf-8")); [print(s["url"]) for s in songs if s.get("url") and "open.spotify.com/track/" in s["url"]]' \
+                >> /tmp/track-urls.txt
             else
               echo "Resolution failed:"
               echo "$source"
-              printf "%s\n" "$source" >> /tmp/resolution-failures.txt
+
+              printf "%s\n" "$source" \
+                >> /tmp/resolution-failures.txt
             fi
           done < urls.txt
 
@@ -312,7 +314,9 @@ jobs:
           page=1
 
           while true; do
-            repos=$(api_get "${API}/user/repos?visibility=all&affiliation=owner&per_page=100&page=${page}")
+            repos=$(api_get \
+              "${API}/user/repos?visibility=all&affiliation=owner&per_page=100&page=${page}")
+
             count=$(printf "%s" "$repos" | jq "length")
 
             if [ "$count" -eq 0 ]; then
@@ -339,7 +343,9 @@ jobs:
 
           current_number="$highest_number"
 
-          printf -v current_repo "music-library-%03d" "$current_number"
+          printf -v current_repo \
+            "music-library-%03d" \
+            "$current_number"
 
           echo ""
           echo "Current library:"
@@ -348,7 +354,10 @@ jobs:
           ensure_repo() {
             local repo="$1"
 
-            if api_get "${API}/repos/donbt256/${repo}" >/dev/null 2>&1; then
+            if api_get \
+              "${API}/repos/${LIBRARY_OWNER}/${repo}" \
+              >/dev/null 2>&1
+            then
               echo "Repository exists: $repo"
               return
             fi
@@ -370,7 +379,9 @@ jobs:
                 auto_init: false
               }')
 
-            api_post "${API}/user/repos" "$body" >/dev/null
+            api_post \
+              "${API}/user/repos" \
+              "$body" >/dev/null
 
             echo "Created: $repo"
           }
@@ -385,38 +396,33 @@ jobs:
             echo ""
             echo "Cloning $repo..."
 
-            GIT_LFS_SKIP_SMUDGE=1 git clone \
-              "https://x-access-token:${GIT_PAT}@github.com/donbt256/${repo}.git" \
+            git clone \
+              "https://x-access-token:${GIT_PAT}@github.com/${LIBRARY_OWNER}/${repo}.git" \
               /tmp/library
 
             cd /tmp/library
 
-            git lfs install --local
-            git lfs track "*.mp3"
-
-            git add .gitattributes
-
-            if ! git diff --cached --quiet; then
-              git commit -m "Configure Git LFS"
-            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           }
 
           get_library_size() {
             cd /tmp/library
 
-            size=$(
-              git lfs ls-files --debug 2>/dev/null |
+            git ls-files -z |
+              while IFS= read -r -d '' file; do
+                if [ -f "$file" ]; then
+                  stat -c "%s" "$file"
+                fi
+              done |
               awk '
-                /^    size:/ {
-                  total += $2
+                {
+                  total += $1
                 }
                 END {
                   print total + 0
                 }
               '
-            )
-
-            echo "${size:-0}"
           }
 
           push_library() {
@@ -434,9 +440,10 @@ jobs:
 
             if ! git diff --cached --quiet; then
               git commit -m "Add downloaded music"
+            else
+              echo "No library changes to commit."
             fi
 
-            git lfs push origin main
             git push origin main
 
             echo "Push complete."
@@ -478,14 +485,16 @@ jobs:
 
             if [ "$current_size" -gt 0 ] && [ "$projected_size" -gt "$LIBRARY_LIMIT_BYTES" ]; then
               echo ""
-              echo "4.5 GB threshold reached."
+              echo "900 MiB threshold reached."
               echo "Rolling over."
 
               push_library "$current_size"
 
               current_number=$((current_number + 1))
 
-              printf -v current_repo "music-library-%03d" "$current_number"
+              printf -v current_repo \
+                "music-library-%03d" \
+                "$current_number"
 
               clone_library "$current_repo"
 
@@ -587,4 +596,3 @@ jobs:
           fi
 
           exit 0
-          
