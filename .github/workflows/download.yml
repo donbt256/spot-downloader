@@ -563,7 +563,8 @@ jobs:
                   --arg album_artist "$album_artist" \
                   --arg release_date "$release_date" \
                   --arg cover_url "$cover_url" \
-                  --argjson offset "$offset" '
+                  --argjson offset "$offset" \
+                  --argjson total_tracks "$total_tracks" '
                     .items[]
                     | select(.is_local != true)
                     | {
