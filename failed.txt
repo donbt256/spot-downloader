@@ -6,4 +6,10 @@
 2026-09-24T15:28:55Z | source=1 | class=resolver-data-corruption | reason=invalid JSON record
 2026-09-24T15:29:14Z | source=https://open.spotify.com/track/5plW0IS6XNNFFvLCH15edI | track=Arms Tonite | provider=soundcloud | class=identity-mismatch | expected=216.000s | actual=208.117551s
 2026-09-24T15:29:35Z | source=1 | class=resolver-data-corruption | reason=invalid JSON record
+2026-09-24T16:08:39Z | source=1 | class=resolver-data-corruption | reason=invalid JSON record
+2026-09-24T16:08:55Z | source=https://open.spotify.com/track/15geVctY3jvUuDkEAaQPdV | track=O My Heart | provider=soundcloud | class=identity-mismatch | expected=211.000s | actual=258.951837s
+2026-09-24T16:09:14Z | source=1 | class=resolver-data-corruption | reason=invalid JSON record
+2026-09-24T16:09:37Z | source=1 | class=resolver-data-corruption | reason=invalid JSON record
+2026-09-24T16:09:52Z | source=https://open.spotify.com/track/007JQyyu6DrGza9XX6scAN | track=Wrecking Ball | provider=soundcloud | class=identity-mismatch | expected=194.000s | actual=181.838367s
+2026-09-24T16:10:12Z | source=1 | class=resolver-data-corruption | reason=invalid JSON record
 Could not resolve: https://open.spotify.com/album/41U6Qbx5KxhHYIuwlK3lXA
