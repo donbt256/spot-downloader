@@ -71,9 +71,12 @@ jobs:
           set -u
 
           while IFS= read -r source || [ -n "$source" ]; do
-            if [ -z "${source//[[:space:]]/}" ]; then
-              continue
-            fi
+            source="${source#"${source%%[![:space:]]*}"}"
+            source="${source%"${source##*[![:space:]]}"}"
+
+          if [ -z "$source" ] || [[ "$source" == \#* ]]; then
+           continue
+          fi
 
             echo ""
             echo "========================================"
