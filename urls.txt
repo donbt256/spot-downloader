@@ -1,6 +1,6 @@
 # Manual retry trigger; no track selection changed.
 https://open.spotify.com/album/41U6Qbx5KxhHYIuwlK3lXA
-# https://open.spotify.com/album/03EqExvZuxLK86huLxGIa2
+https://open.spotify.com/album/03EqExvZuxLK86huLxGIa2
 # https://open.spotify.com/album/0DQyTVcDhK9wm0f6RaErWO
 # https://open.spotify.com/album/4jVVAenBaHRF8w0MV6qKw7
 # https://open.spotify.com/album/1JpaFJzzcsiulO6MdIcQdK

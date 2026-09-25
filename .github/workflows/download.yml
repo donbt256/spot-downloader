@@ -918,7 +918,7 @@ jobs:
               echo "Searching SoundCloud: ${soundcloud_query}"
 
               yt-dlp \
-                "scsearch10:${soundcloud_query}" \
+                "scsearch50:${soundcloud_query}" \
                 --flat-playlist \
                 --dump-json \
                 --skip-download \
